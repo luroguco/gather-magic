@@ -1,0 +1,20 @@
+{
+  "name": "mtga-collection-explorer",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "apps/*"
+  ],
+  "scripts": {
+    "build": "npm run build -w @mtga/api && npm run build -w @mtga/web",
+    "dev": "concurrently \"npm run dev -w @mtga/api\" \"npm run dev -w @mtga/web\"",
+    "test": "npm run test -w @mtga/api",
+    "lint": "npm run lint -w @mtga/api && npm run lint -w @mtga/web",
+    "db:sync": "npm run db:sync -w @mtga/api",
+    "start": "npm run start -w @mtga/api"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1",
+    "typescript": "^5.9.3"
+  }
+}

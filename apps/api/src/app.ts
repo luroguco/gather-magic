@@ -1,0 +1,193 @@
+import Fastify from "fastify";
+import cors from "@fastify/cors";
+import multipart from "@fastify/multipart";
+import { z } from "zod";
+import { createDatabase, type DbHandle } from "./lib/database.js";
+import { ARENA_FORMATS } from "./lib/formats.js";
+import { importCollectionCsv } from "./services/collectionImport.js";
+import { getCardById, getCollectionSummary, listMechanics, searchCards } from "./services/cardsRepository.js";
+import { createDeck, exportDeckForArena, getDeck, listDecks, updateDeck, validateDeck } from "./services/decks.js";
+
+const MAX_SEARCH_PAGE_SIZE = 50_000;
+
+const searchQuerySchema = z.object({
+  q: z.string().optional(),
+  format: z.enum(ARENA_FORMATS).optional(),
+  colors: z.string().optional(),
+  mechanics: z.string().optional(),
+  types: z.string().optional(),
+  subtypes: z.string().optional(),
+  rarity: z.string().optional(),
+  sets: z.string().optional(),
+  ownedOnly: z
+    .string()
+    .optional()
+    .transform((value) => value === "true"),
+  manaValueMin: z
+    .string()
+    .optional()
+    .transform((value) => (value ? Number.parseFloat(value) : undefined)),
+  manaValueMax: z
+    .string()
+    .optional()
+    .transform((value) => (value ? Number.parseFloat(value) : undefined)),
+  page: z
+    .string()
+    .optional()
+    .transform((value) => (value ? Number.parseInt(value, 10) : 1)),
+  pageSize: z
+    .string()
+    .optional()
+    .transform((value) => (value ? Math.min(Number.parseInt(value, 10), MAX_SEARCH_PAGE_SIZE) : MAX_SEARCH_PAGE_SIZE))
+});
+
+const mechanicsQuerySchema = z.object({
+  ownedOnly: z
+    .string()
+    .optional()
+    .transform((value) => value === "true")
+});
+
+const deckCardSchema = z.object({
+  cardId: z.string().min(1),
+  quantity: z.number().int().positive(),
+  section: z.enum(["main", "sideboard", "commander"])
+});
+
+const createDeckSchema = z.object({
+  name: z.string().min(1),
+  format: z.enum(ARENA_FORMATS),
+  notes: z.string().optional().default(""),
+  cards: z.array(deckCardSchema).optional()
+});
+
+const updateDeckSchema = z.object({
+  name: z.string().min(1).optional(),
+  format: z.enum(ARENA_FORMATS).optional(),
+  notes: z.string().optional(),
+  cards: z.array(deckCardSchema).optional()
+});
+
+const splitCsvParam = (value?: string) =>
+  value?.split(",").map((entry) => entry.trim()).filter(Boolean) ?? undefined;
+
+export const buildApp = (db: DbHandle = createDatabase()) => {
+  const app = Fastify({
+    logger: false
+  });
+
+  app.register(cors, {
+    origin: true
+  });
+  app.register(multipart);
+
+  app.get("/api/health", async () => ({
+    ok: true
+  }));
+
+  app.get("/api/status", async () => ({
+    collection: getCollectionSummary(db),
+    cards: db.prepare("SELECT COUNT(*) AS total FROM cards").get()
+  }));
+
+  app.get("/api/mechanics", async (request) => {
+    const query = mechanicsQuerySchema.parse(request.query);
+    return {
+      items: listMechanics(db, {
+        ownedOnly: query.ownedOnly
+      })
+    };
+  });
+
+  app.get("/api/cards/search", async (request) => {
+    const query = searchQuerySchema.parse(request.query);
+    return searchCards(db, {
+      q: query.q,
+      format: query.format,
+      colors: splitCsvParam(query.colors),
+      mechanics: splitCsvParam(query.mechanics),
+      types: splitCsvParam(query.types),
+      subtypes: splitCsvParam(query.subtypes),
+      rarity: splitCsvParam(query.rarity),
+      sets: splitCsvParam(query.sets),
+      ownedOnly: query.ownedOnly,
+      manaValueMin: query.manaValueMin,
+      manaValueMax: query.manaValueMax,
+      page: query.page,
+      pageSize: query.pageSize
+    });
+  });
+
+  app.get("/api/cards/:id", async (request, reply) => {
+    const params = z.object({ id: z.string() }).parse(request.params);
+    const card = getCardById(db, params.id);
+    if (!card) {
+      reply.code(404);
+      return { error: "Card not found" };
+    }
+    return card;
+  });
+
+  app.post("/api/imports/collection-csv", async (request, reply) => {
+    const file = await request.file();
+    if (!file) {
+      reply.code(400);
+      return { error: "Expected a multipart file field." };
+    }
+    const csvContent = await file.toBuffer();
+    const result = importCollectionCsv(db, csvContent.toString("utf8"));
+    return result;
+  });
+
+  app.get("/api/decks", async () => ({
+    items: listDecks(db)
+  }));
+
+  app.post("/api/decks", async (request) => {
+    const input = createDeckSchema.parse(request.body);
+    return createDeck(db, input);
+  });
+
+  app.get("/api/decks/:id", async (request, reply) => {
+    const params = z.object({ id: z.string() }).parse(request.params);
+    const deck = getDeck(db, params.id);
+    if (!deck) {
+      reply.code(404);
+      return { error: "Deck not found" };
+    }
+    return deck;
+  });
+
+  app.patch("/api/decks/:id", async (request, reply) => {
+    const params = z.object({ id: z.string() }).parse(request.params);
+    const input = updateDeckSchema.parse(request.body);
+    const deck = updateDeck(db, params.id, input);
+    if (!deck) {
+      reply.code(404);
+      return { error: "Deck not found" };
+    }
+    return deck;
+  });
+
+  app.post("/api/decks/:id/validate", async (request, reply) => {
+    const params = z.object({ id: z.string() }).parse(request.params);
+    const validation = validateDeck(db, params.id);
+    if (!validation) {
+      reply.code(404);
+      return { error: "Deck not found" };
+    }
+    return validation;
+  });
+
+  app.get("/api/decks/:id/export/arena", async (request, reply) => {
+    const params = z.object({ id: z.string() }).parse(request.params);
+    const exportPayload = exportDeckForArena(db, params.id);
+    if (!exportPayload) {
+      reply.code(404);
+      return { error: "Deck not found" };
+    }
+    return exportPayload;
+  });
+
+  return app;
+};
