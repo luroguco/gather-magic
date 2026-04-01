@@ -1,4 +1,4 @@
-import type { AppStatus, CardDetail, Deck, DeckCard, DeckListItem, Mechanic, SearchResponse, ValidationResult } from "./types";
+import type { AppStatus, CardDetail, Deck, DeckCard, DeckListItem, Mechanic, UntappedCaptureImportSummary, UntappedCaptureStartResult, UntappedCaptureStatus, UntappedCaptureStopResult, SearchResponse, UntappedImportSummary, ValidationResult } from "./types";
 export declare const getStatus: () => Promise<AppStatus>;
 export declare const getMechanics: (options?: {
     ownedOnly?: boolean;
@@ -12,6 +12,13 @@ export declare const uploadCollection: (file: File) => Promise<{
     ownedCopies: number;
     unresolvedRows: Array<Record<string, string>>;
 }>;
+export declare const previewUntappedCollection: (file: File) => Promise<UntappedImportSummary>;
+export declare const importUntappedCollection: (file: File) => Promise<UntappedImportSummary>;
+export declare const getUntappedHelperStatus: () => Promise<UntappedCaptureStatus>;
+export declare const startUntappedHelper: () => Promise<UntappedCaptureStartResult>;
+export declare const stopUntappedHelper: () => Promise<UntappedCaptureStopResult>;
+export declare const previewLatestUntappedCapture: () => Promise<UntappedCaptureImportSummary>;
+export declare const importLatestUntappedCapture: () => Promise<UntappedCaptureImportSummary>;
 export declare const listDecks: () => Promise<DeckListItem[]>;
 export declare const getDeck: (id: string) => Promise<Deck>;
 export declare const createDeck: (payload: {

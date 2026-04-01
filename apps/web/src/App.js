@@ -1,7 +1,7 @@
 import { jsx as _jsx, jsxs as _jsxs, Fragment as _Fragment } from "react/jsx-runtime";
 import { useDeferredValue, useEffect, useRef, useState, startTransition } from "react";
 import { CardCornerVisual, CardMetaSummary, ColorStrip, getCardAccentColors, getMechanicSummary, OwnershipDots, RenderOraclePreview, trailingActionButtons, VerticalColorStrip } from "./cardPresentation";
-import { createDeck, exportDeck, getCard, getDeck, getMechanics, getStatus, listDecks, searchCards, updateDeck, uploadCollection, validateDeck } from "./api";
+import { createDeck, exportDeck, getCard, getDeck, getMechanics, getStatus, getUntappedHelperStatus, importUntappedCollection, importLatestUntappedCapture, listDecks, previewUntappedCollection, previewLatestUntappedCapture, startUntappedHelper, stopUntappedHelper, searchCards, updateDeck, uploadCollection, validateDeck } from "./api";
 const FORMATS = [
     ["standard", "Standard"],
     ["alchemy", "Alchemy"],
@@ -41,6 +41,19 @@ const THEME_OPTIONS = [
     { value: "coast", label: "Coast", tone: "light" },
     { value: "mountain", label: "Mountain", tone: "light" }
 ];
+const UNTAPPED_CAPTURE_SNIPPET = `(async () => {
+  const collection = await window.electron.ipcRenderer.invoke("mtga.collection.invoke");
+  const total = Object.values(collection ?? {}).reduce((sum, value) => sum + Number(value || 0), 0);
+  console.log("mtga.collection entries:", Object.keys(collection ?? {}).length);
+  console.log("mtga.collection total quantity:", total);
+  const blob = new Blob([JSON.stringify(collection, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "untapped-mtga-collection.json";
+  a.click();
+  URL.revokeObjectURL(url);
+})();`;
 const derivedBucketLabels = {
     advantage: "Card Advantage",
     removal: "Removal",
@@ -181,6 +194,16 @@ const mergeDeckCard = (cards, cardId, section) => {
         : card);
 };
 const formatDateTime = (value) => value ? new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(new Date(value)) : "Never";
+const formatCatalogLabel = (preview) => {
+    if (!preview) {
+        return "Pending preview";
+    }
+    if (preview.catalogSource === "database") {
+        return "Local catalog";
+    }
+    const buildLabel = preview.catalogMetadata?.build ? ` build ${preview.catalogMetadata.build}` : "";
+    return `Untapped public${buildLabel}`;
+};
 const formatOwnedCount = (card) => {
     if (card.rawOwnedCount <= 0) {
         return "0 owned";
@@ -196,6 +219,8 @@ const getFormatLabel = (format) => FORMATS.find(([value]) => value === format)?.
 const truncateDeckName = (name, max = 16) => name.length <= max ? name : `${name.slice(0, Math.max(1, max - 3))}...`;
 const getDeckTypeBucket = (typeLine) => CARD_TYPES.find((type) => typeLine.toLowerCase().includes(type.toLowerCase())) ?? "Other";
 const getUntappedSearchUrl = (cardName) => `https://duckduckgo.com/?q=${encodeURIComponent(`site:mtga.untapped.gg/meta/cards "${cardName}"`)}`;
+const formatFileSize = (size) => size >= 1024 ? `${(size / 1024).toFixed(1)} KB` : `${size} B`;
+const getUntappedCaptureIdentity = (capture) => capture ? `${capture.path}::${capture.modifiedAt}` : null;
 function App() {
     const [status, setStatus] = useState(null);
     const [mechanics, setMechanics] = useState([]);
@@ -216,6 +241,15 @@ function App() {
     const [quickDeckFormat, setQuickDeckFormat] = useState("standard");
     const [importMessage, setImportMessage] = useState("");
     const [errorMessage, setErrorMessage] = useState("");
+    const [untappedFile, setUntappedFile] = useState(null);
+    const [untappedPreview, setUntappedPreview] = useState(null);
+    const [untappedPreviewLoading, setUntappedPreviewLoading] = useState(false);
+    const [untappedImporting, setUntappedImporting] = useState(false);
+    const [untappedHelperStatus, setUntappedHelperStatus] = useState(null);
+    const [untappedHelperLoading, setUntappedHelperLoading] = useState(false);
+    const [untappedGuideActive, setUntappedGuideActive] = useState(false);
+    const [untappedPreviewSource, setUntappedPreviewSource] = useState(null);
+    const [lastAutoPreviewedCaptureId, setLastAutoPreviewedCaptureId] = useState(null);
     const [glossaryOpen, setGlossaryOpen] = useState(false);
     const [glossaryQuery, setGlossaryQuery] = useState("");
     const [deckDrawerOpen, setDeckDrawerOpen] = useState(false);
@@ -273,6 +307,29 @@ function App() {
     const loadStatus = async () => {
         const nextStatus = await getStatus();
         setStatus(nextStatus);
+    };
+    const refreshUntappedHelperStatus = async () => {
+        const nextStatus = await getUntappedHelperStatus();
+        setUntappedHelperStatus(nextStatus);
+        return nextStatus;
+    };
+    const copyUntappedSnippetToClipboard = async (snippet) => {
+        if (typeof navigator === "undefined" || !navigator.clipboard?.writeText) {
+            return false;
+        }
+        try {
+            await navigator.clipboard.writeText(snippet);
+            return true;
+        }
+        catch {
+            return false;
+        }
+    };
+    const refreshCollectionViewsAfterImport = async () => {
+        await loadStatus();
+        startTransition(() => {
+            setSearchState((current) => ({ ...current }));
+        });
     };
     const loadDecks = async (selectDeckId) => {
         const decks = await listDecks();
@@ -368,6 +425,71 @@ function App() {
             window.requestAnimationFrame(restore);
         });
     }, [activeTab]);
+    useEffect(() => {
+        if (activeTab !== "import") {
+            return;
+        }
+        void refreshUntappedHelperStatus().catch((error) => {
+            setErrorMessage(error instanceof Error ? error.message : "Failed to load Untapped helper status.");
+        });
+    }, [activeTab]);
+    useEffect(() => {
+        if (activeTab !== "import" || !untappedGuideActive || typeof window === "undefined") {
+            return;
+        }
+        let cancelled = false;
+        const poll = async () => {
+            try {
+                const nextStatus = await getUntappedHelperStatus();
+                if (cancelled) {
+                    return;
+                }
+                setUntappedHelperStatus(nextStatus);
+                if (!nextStatus.showDevTools) {
+                    setUntappedGuideActive(false);
+                }
+                const latestCaptureId = getUntappedCaptureIdentity(nextStatus.latestCapture);
+                if (!latestCaptureId || latestCaptureId === lastAutoPreviewedCaptureId) {
+                    return;
+                }
+                setLastAutoPreviewedCaptureId(latestCaptureId);
+                setUntappedPreviewLoading(true);
+                try {
+                    const preview = await previewLatestUntappedCapture();
+                    if (cancelled) {
+                        return;
+                    }
+                    setUntappedFile(null);
+                    setUntappedPreview(preview);
+                    setUntappedPreviewSource("latest-capture");
+                    setImportMessage(`Detected new Untapped capture: ${preview.capture.filename}. Preview updated automatically.`);
+                }
+                catch (error) {
+                    if (!cancelled) {
+                        setErrorMessage(error instanceof Error ? error.message : "Failed to preview the latest Untapped capture.");
+                    }
+                }
+                finally {
+                    if (!cancelled) {
+                        setUntappedPreviewLoading(false);
+                    }
+                }
+            }
+            catch (error) {
+                if (!cancelled) {
+                    setErrorMessage(error instanceof Error ? error.message : "Failed to poll Untapped capture status.");
+                }
+            }
+        };
+        void poll();
+        const intervalId = window.setInterval(() => {
+            void poll();
+        }, 2500);
+        return () => {
+            cancelled = true;
+            window.clearInterval(intervalId);
+        };
+    }, [activeTab, lastAutoPreviewedCaptureId, untappedGuideActive]);
     const saveDeck = async (deck) => {
         const saved = await updateDeck(deck.id, {
             name: deck.name,
@@ -468,13 +590,142 @@ function App() {
             const result = await uploadCollection(file);
             setImportMessage(`Imported ${result.ownedCopies} owned copies across ${result.cardsMatched} cards. ` +
                 `${result.unresolvedRows.length} rows could not be matched.`);
-            await loadStatus();
-            startTransition(() => {
-                setSearchState((current) => ({ ...current }));
-            });
+            await refreshCollectionViewsAfterImport();
         }
         catch (error) {
             setErrorMessage(error instanceof Error ? error.message : "Collection import failed.");
+        }
+    };
+    const handleStartUntappedGuide = async () => {
+        try {
+            setErrorMessage("");
+            setImportMessage("");
+            setUntappedHelperLoading(true);
+            const result = await startUntappedHelper();
+            const nextStatus = {
+                ...result.status,
+                snippet: result.snippet
+            };
+            setUntappedHelperStatus(nextStatus);
+            setUntappedGuideActive(true);
+            setLastAutoPreviewedCaptureId(getUntappedCaptureIdentity(nextStatus.latestCapture));
+            const copied = await copyUntappedSnippetToClipboard(result.snippet);
+            setImportMessage(copied
+                ? "Untapped guided capture started. The DevTools snippet is in your clipboard."
+                : "Untapped guided capture started. Clipboard copy failed, so paste the snippet shown below manually.");
+        }
+        catch (error) {
+            setErrorMessage(error instanceof Error ? error.message : "Failed to start the Untapped guided capture.");
+        }
+        finally {
+            setUntappedHelperLoading(false);
+        }
+    };
+    const handleStopUntappedGuide = async () => {
+        try {
+            setErrorMessage("");
+            setUntappedHelperLoading(true);
+            const result = await stopUntappedHelper();
+            setUntappedGuideActive(false);
+            setUntappedHelperStatus((current) => ({
+                ...(current ?? { snippet: UNTAPPED_CAPTURE_SNIPPET }),
+                ...result.status
+            }));
+            setImportMessage("Untapped guided capture stopped. DevTools can be closed after restarting Companion.");
+        }
+        catch (error) {
+            setErrorMessage(error instanceof Error ? error.message : "Failed to stop the Untapped guided capture.");
+        }
+        finally {
+            setUntappedHelperLoading(false);
+        }
+    };
+    const handleCopyUntappedSnippet = async () => {
+        const snippet = untappedHelperStatus?.snippet ?? UNTAPPED_CAPTURE_SNIPPET;
+        const copied = await copyUntappedSnippetToClipboard(snippet);
+        if (copied) {
+            setImportMessage("Untapped DevTools snippet copied to clipboard.");
+            return;
+        }
+        setErrorMessage("Clipboard access failed. Paste the snippet from the panel below manually.");
+    };
+    const handlePreviewLatestUntappedCapture = async () => {
+        try {
+            setErrorMessage("");
+            setImportMessage("");
+            setUntappedPreviewLoading(true);
+            const preview = await previewLatestUntappedCapture();
+            setUntappedFile(null);
+            setUntappedPreview(preview);
+            setUntappedPreviewSource("latest-capture");
+            setLastAutoPreviewedCaptureId(getUntappedCaptureIdentity(preview.capture));
+            setImportMessage(`Previewed ${preview.capture.filename} from your Downloads folder.`);
+            await refreshUntappedHelperStatus();
+        }
+        catch (error) {
+            setErrorMessage(error instanceof Error ? error.message : "Failed to preview the latest Untapped capture.");
+        }
+        finally {
+            setUntappedPreviewLoading(false);
+        }
+    };
+    const handleUntappedPreview = async (event) => {
+        const file = event.target.files?.[0];
+        event.target.value = "";
+        if (!file) {
+            return;
+        }
+        try {
+            setErrorMessage("");
+            setImportMessage("");
+            setUntappedFile(file);
+            setUntappedPreview(null);
+            setUntappedPreviewSource("manual-file");
+            setUntappedPreviewLoading(true);
+            const preview = await previewUntappedCollection(file);
+            setUntappedPreview(preview);
+        }
+        catch (error) {
+            setUntappedFile(null);
+            setUntappedPreview(null);
+            setUntappedPreviewSource(null);
+            setErrorMessage(error instanceof Error ? error.message : "Untapped preview failed.");
+        }
+        finally {
+            setUntappedPreviewLoading(false);
+        }
+    };
+    const handleConfirmUntappedImport = async () => {
+        if (!untappedPreviewSource) {
+            return;
+        }
+        try {
+            setErrorMessage("");
+            setImportMessage("");
+            setUntappedImporting(true);
+            let result;
+            if (untappedPreviewSource === "latest-capture") {
+                const latestResult = await importLatestUntappedCapture();
+                setLastAutoPreviewedCaptureId(getUntappedCaptureIdentity(latestResult.capture));
+                result = latestResult;
+            }
+            else if (untappedFile) {
+                result = await importUntappedCollection(untappedFile);
+            }
+            else {
+                throw new Error("Choose an Untapped JSON file or preview the latest capture before importing.");
+            }
+            setUntappedPreview(result);
+            setImportMessage(`Imported ${result.ownedCopies} playable copies across ${result.ownedTitles} titles from Untapped Companion. ` +
+                `${result.unresolvedCards.length} local matches unresolved, ${result.unmatchedGrpIds} grpIds unmatched.`);
+            await refreshCollectionViewsAfterImport();
+            await refreshUntappedHelperStatus();
+        }
+        catch (error) {
+            setErrorMessage(error instanceof Error ? error.message : "Untapped import failed.");
+        }
+        finally {
+            setUntappedImporting(false);
         }
     };
     const handleSelectDeckForPendingAdd = async (deckId) => {
@@ -745,7 +996,11 @@ function App() {
                                                                         }
                                                                         const arenaExport = await exportDeck(activeDeck.id);
                                                                         setExportText(arenaExport.text);
-                                                                    }, type: "button", children: "Refresh export" })] }), validation?.ownershipGaps.length ? (_jsx("ul", { className: "issue-list", children: validation.ownershipGaps.map((gap) => (_jsxs("li", { children: [gap.name, ": need ", gap.needed, ", own ", gap.owned, ", missing ", gap.missing] }, gap.cardId))) })) : (_jsx("p", { className: "empty-state", children: "No ownership gaps for the current list." }))] })] }), _jsxs("div", { className: "subpanel export-panel", children: [_jsx("div", { className: "panel-header", children: _jsx("h3", { children: "Arena Export" }) }), _jsx("textarea", { readOnly: true, rows: 12, value: exportText })] })] })) : (_jsx("p", { className: "empty-state", children: "Create a deck to start building." })) })] })) : null, activeTab === "import" ? (_jsxs("div", { className: "workspace-grid", children: [_jsxs("section", { className: "panel import-panel", children: [_jsxs("div", { className: "panel-header", children: [_jsx("h2", { children: "Collection Import" }), _jsx("span", { children: "Manual Arena CSV upload" })] }), _jsx("p", { className: "hero-copy", children: "Upload an MTG Arena collection export. The new file replaces the current ownership snapshot atomically." }), _jsxs("label", { className: "upload-drop", children: [_jsx("input", { accept: ".csv,text/csv", onChange: handleImport, type: "file" }), _jsx("span", { children: "Choose your Arena collection CSV" }), _jsx("small", { children: "Required columns: Id, Name, Set, Color, Rarity, Count, PrintCount" })] })] }), _jsxs("section", { className: "panel import-panel", children: [_jsxs("div", { className: "panel-header", children: [_jsx("h2", { children: "Current Snapshot" }), _jsx("span", { children: "Collection status" })] }), _jsxs("div", { className: "snapshot-grid", children: [_jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "Stored entries" }), _jsx("strong", { children: status?.collection.ownedEntries ?? 0 })] }), _jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "Unique names" }), _jsx("strong", { children: status?.collection.uniqueNames ?? 0 })] }), _jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "Owned copies" }), _jsx("strong", { children: status?.collection.ownedCopies ?? 0 })] }), _jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "Owned rows" }), _jsx("strong", { children: status?.collection.importRowsWithCopies ?? 0 })] }), _jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "Unresolved rows" }), _jsx("strong", { children: status?.collection.unresolvedEntries ?? 0 })] }), _jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "Imported at" }), _jsx("strong", { children: formatDateTime(status?.collection.importedAt ?? null) })] })] })] })] })) : null] }), glossaryOpen ? (_jsx("div", { className: "modal-shell", onClick: () => setGlossaryOpen(false), role: "presentation", children: _jsxs("div", { className: "modal-card", onClick: (event) => event.stopPropagation(), role: "dialog", "aria-modal": "true", "aria-label": "Mechanic glossary", children: [_jsxs("div", { className: "panel-header", children: [_jsxs("div", { children: [_jsx("h2", { children: "Mechanic Glossary" }), _jsxs("span", { children: [glossaryItems.length, " visible mechanics"] })] }), _jsx("button", { className: "ghost-button subtle-button", onClick: () => setGlossaryOpen(false), type: "button", children: "Close" })] }), _jsxs("label", { className: "field", children: [_jsx("span", { children: "Find a mechanic" }), _jsx("input", { value: glossaryQuery, onChange: (event) => setGlossaryQuery(event.target.value), placeholder: "Search names and definitions" })] }), _jsxs("div", { className: "glossary-list modal-glossary-list", children: [glossaryFavorites.length ? (_jsxs("section", { className: "glossary-group", children: [_jsx("h3", { children: "Pinned" }), glossaryFavorites.map((mechanic) => {
+                                                                    }, type: "button", children: "Refresh export" })] }), validation?.ownershipGaps.length ? (_jsx("ul", { className: "issue-list", children: validation.ownershipGaps.map((gap) => (_jsxs("li", { children: [gap.name, ": need ", gap.needed, ", own ", gap.owned, ", missing ", gap.missing] }, gap.cardId))) })) : (_jsx("p", { className: "empty-state", children: "No ownership gaps for the current list." }))] })] }), _jsxs("div", { className: "subpanel export-panel", children: [_jsx("div", { className: "panel-header", children: _jsx("h3", { children: "Arena Export" }) }), _jsx("textarea", { readOnly: true, rows: 12, value: exportText })] })] })) : (_jsx("p", { className: "empty-state", children: "Create a deck to start building." })) })] })) : null, activeTab === "import" ? (_jsxs("div", { className: "workspace-grid import-workspace", children: [_jsxs("section", { className: "panel import-panel snapshot-panel", children: [_jsxs("div", { className: "panel-header", children: [_jsx("h2", { children: "Current Snapshot" }), _jsx("span", { children: "Collection status" })] }), _jsxs("div", { className: "snapshot-grid", children: [_jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "Stored entries" }), _jsx("strong", { children: status?.collection.ownedEntries ?? 0 })] }), _jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "Unique names" }), _jsx("strong", { children: status?.collection.uniqueNames ?? 0 })] }), _jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "Owned copies" }), _jsx("strong", { children: status?.collection.ownedCopies ?? 0 })] }), _jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "Owned rows" }), _jsx("strong", { children: status?.collection.importRowsWithCopies ?? 0 })] }), _jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "Unresolved rows" }), _jsx("strong", { children: status?.collection.unresolvedEntries ?? 0 })] }), _jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "Imported at" }), _jsx("strong", { children: formatDateTime(status?.collection.importedAt ?? null) })] })] })] }), _jsxs("div", { className: "import-stack", children: [_jsxs("section", { className: "panel import-panel", children: [_jsxs("div", { className: "panel-header", children: [_jsx("h2", { children: "Untapped Companion" }), _jsx("span", { children: "Safe bridge import" })] }), _jsxs("p", { className: "hero-copy", children: ["Capture a local ", _jsx("code", { children: "mtga.collection" }), " JSON dump from Untapped Companion, preview it here, then replace your current collection snapshot."] }), _jsxs("div", { className: "helper-toolbar", children: [_jsx("button", { className: "primary-button", disabled: untappedHelperLoading, onClick: handleStartUntappedGuide, type: "button", children: untappedHelperLoading ? "Starting..." : "Start guided capture" }), _jsx("button", { className: "ghost-button", onClick: handleCopyUntappedSnippet, type: "button", children: "Copy snippet" }), _jsx("button", { className: "ghost-button", disabled: !untappedHelperStatus?.latestCapture || untappedPreviewLoading, onClick: handlePreviewLatestUntappedCapture, type: "button", children: "Preview latest download" }), _jsx("button", { className: "ghost-button", disabled: untappedHelperLoading || !untappedHelperStatus?.showDevTools, onClick: handleStopUntappedGuide, type: "button", children: "Stop guided capture" })] }), _jsx("p", { className: "helper-note", children: "Guided mode enables Untapped DevTools, watches your Downloads folder, and previews the next capture automatically after the JSON download finishes." }), untappedHelperStatus ? (_jsxs("div", { className: "subpanel helper-status-panel", children: [_jsxs("div", { className: "panel-header", children: [_jsx("h3", { children: "Local helper status" }), _jsx("span", { children: untappedGuideActive ? "Watching for new captures" : "Idle" })] }), _jsxs("div", { className: "snapshot-grid helper-status-grid", children: [_jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "DevTools" }), _jsx("strong", { children: untappedHelperStatus.showDevTools ? "Enabled" : "Disabled" })] }), _jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "Helper" }), _jsx("strong", { children: untappedHelperStatus.available ? "Ready" : "Unavailable" })] }), _jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "Latest capture" }), _jsx("strong", { children: untappedHelperStatus.latestCapture ? untappedHelperStatus.latestCapture.filename : "None yet" })] }), _jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "Updated" }), _jsx("strong", { children: untappedHelperStatus.latestCapture
+                                                                            ? formatDateTime(untappedHelperStatus.latestCapture.modifiedAt)
+                                                                            : "Waiting" })] })] }), _jsxs("div", { className: "helper-path-list", children: [_jsxs("p", { children: [_jsx("strong", { children: "Downloads:" }), " ", _jsx("code", { children: untappedHelperStatus.downloadsPath })] }), _jsxs("p", { children: [_jsx("strong", { children: "Config:" }), " ", _jsx("code", { children: untappedHelperStatus.configPath })] }), untappedHelperStatus.latestCapture ? (_jsxs("p", { children: [_jsx("strong", { children: "Latest file:" }), " ", _jsx("code", { children: untappedHelperStatus.latestCapture.path }), " (", formatFileSize(untappedHelperStatus.latestCapture.size), ")"] })) : null] })] })) : null, _jsxs("ol", { className: "import-steps", children: [_jsx("li", { children: "Open Untapped Companion and MTGA Deck Builder." }), _jsx("li", { children: "Open Untapped DevTools and run this console snippet." }), _jsx("li", { children: "Wait for the download or upload the JSON manually if the watcher misses it." })] }), _jsx("pre", { className: "capture-snippet", children: _jsx("code", { children: untappedHelperStatus?.snippet ?? UNTAPPED_CAPTURE_SNIPPET }) }), _jsxs("label", { className: "upload-drop", children: [_jsx("input", { accept: ".json,application/json", onChange: handleUntappedPreview, type: "file" }), _jsx("span", { children: untappedFile ? untappedFile.name : "Choose your Untapped collection JSON" }), _jsxs("small", { children: ["Raw ", _jsx("code", { children: "grpId -> quantity" }), " map exported from the Untapped renderer."] })] }), untappedPreviewLoading ? (_jsx("p", { className: "empty-state", children: "Previewing Untapped collection..." })) : null, untappedPreview ? (_jsxs("div", { className: "untapped-preview", children: [_jsxs("div", { className: "panel-header preview-header", children: [_jsxs("div", { children: [_jsx("h3", { children: "Preview" }), _jsxs("span", { children: [formatCatalogLabel(untappedPreview), untappedPreviewSource === "latest-capture" && untappedHelperStatus?.latestCapture
+                                                                                ? ` · ${untappedHelperStatus.latestCapture.filename}`
+                                                                                : ""] })] }), _jsx("button", { className: "primary-button", disabled: untappedImporting, onClick: handleConfirmUntappedImport, type: "button", children: untappedImporting ? "Importing..." : "Confirm import" })] }), _jsxs("div", { className: "snapshot-grid import-preview-grid", children: [_jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "Owned titles" }), _jsx("strong", { children: untappedPreview.ownedTitles })] }), _jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "Playable copies" }), _jsx("strong", { children: untappedPreview.ownedCopies })] }), _jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "Variant copies" }), _jsx("strong", { children: untappedPreview.rawOwnedCopies })] }), _jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "Matched grpIds" }), _jsx("strong", { children: untappedPreview.matchedGrpIds })] }), _jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "Unmatched grpIds" }), _jsx("strong", { children: untappedPreview.unmatchedGrpIds })] }), _jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "Extracted path" }), _jsx("strong", { children: untappedPreview.extractedPath })] })] }), _jsxs("div", { className: "snapshot-grid import-diff-grid", children: [_jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "Added titles" }), _jsx("strong", { children: untappedPreview.diff.addedTitles })] }), _jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "Removed titles" }), _jsx("strong", { children: untappedPreview.diff.removedTitles })] }), _jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "Changed titles" }), _jsx("strong", { children: untappedPreview.diff.changedTitles })] }), _jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "Unchanged titles" }), _jsx("strong", { children: untappedPreview.diff.unchangedTitles })] })] }), untappedPreview.unresolvedCards.length ? (_jsxs("div", { className: "subpanel import-warning-panel", children: [_jsxs("div", { className: "panel-header", children: [_jsx("h3", { children: "Unresolved local matches" }), _jsx("span", { children: untappedPreview.unresolvedCards.length })] }), _jsx("ul", { className: "issue-list", children: untappedPreview.unresolvedCards.slice(0, 6).map((entry) => (_jsxs("li", { children: [entry.name, ": ", entry.titleCount, " playable, ", entry.printCount, " variant copies"] }, entry.name))) })] })) : null, untappedPreview.unmatchedEntries.length ? (_jsxs("div", { className: "subpanel import-warning-panel", children: [_jsxs("div", { className: "panel-header", children: [_jsx("h3", { children: "Catalog misses" }), _jsx("span", { children: untappedPreview.unmatchedEntries.length })] }), _jsx("ul", { className: "issue-list", children: untappedPreview.unmatchedEntries.slice(0, 6).map((entry) => (_jsxs("li", { children: ["grpId ", entry.grpId, ": qty ", entry.quantity] }, entry.grpId))) })] })) : null] })) : null] }), _jsxs("section", { className: "panel import-panel", children: [_jsxs("div", { className: "panel-header", children: [_jsx("h2", { children: "Collection CSV" }), _jsx("span", { children: "Fallback import" })] }), _jsx("p", { className: "hero-copy", children: "Upload an MTG Arena collection export. The new file replaces the current ownership snapshot atomically." }), _jsxs("label", { className: "upload-drop", children: [_jsx("input", { accept: ".csv,text/csv", onChange: handleImport, type: "file" }), _jsx("span", { children: "Choose your Arena collection CSV" }), _jsx("small", { children: "Required columns: Id, Name, Set, Color, Rarity, Count, PrintCount" })] })] })] })] })) : null] }), glossaryOpen ? (_jsx("div", { className: "modal-shell", onClick: () => setGlossaryOpen(false), role: "presentation", children: _jsxs("div", { className: "modal-card glossary-modal", onClick: (event) => event.stopPropagation(), role: "dialog", "aria-modal": "true", "aria-label": "Mechanic glossary", children: [_jsxs("div", { className: "panel-header", children: [_jsxs("div", { children: [_jsx("h2", { children: "Mechanic Glossary" }), _jsxs("span", { children: [glossaryItems.length, " visible mechanics"] })] }), _jsx("button", { className: "ghost-button subtle-button", onClick: () => setGlossaryOpen(false), type: "button", children: "Close" })] }), _jsxs("label", { className: "field", children: [_jsx("span", { children: "Find a mechanic" }), _jsx("input", { value: glossaryQuery, onChange: (event) => setGlossaryQuery(event.target.value), placeholder: "Search names and definitions" })] }), _jsxs("div", { className: "glossary-list modal-glossary-list", children: [glossaryFavorites.length ? (_jsxs("section", { className: "glossary-group", children: [_jsx("h3", { children: "Pinned" }), glossaryFavorites.map((mechanic) => {
                                             const selected = searchState.mechanics.includes(mechanic.slug);
                                             const pinned = favoriteSet.has(mechanic.slug);
                                             return (_jsxs("article", { className: selected ? "glossary-item glossary-entry active" : "glossary-item glossary-entry", children: [_jsxs("div", { className: "glossary-heading", children: [_jsx("strong", { children: mechanic.label }), _jsxs("small", { children: [mechanic.type, " \u00B7 ", mechanic.usageCount, " cards"] })] }), _jsx("p", { children: mechanic.definition }), _jsxs("div", { className: "glossary-actions", children: [_jsx("button", { className: selected ? "chip active" : "chip", onClick: () => toggleMechanic(mechanic.slug), type: "button", children: selected ? "Selected" : "Filter" }), _jsx("button", { className: pinned ? "chip active" : "chip", onClick: () => toggleFavoriteMechanic(mechanic.slug), type: "button", children: pinned ? "Pinned" : "Pin" })] })] }, `${mechanic.type}-${mechanic.slug}`));

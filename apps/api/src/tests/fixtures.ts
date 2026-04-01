@@ -166,3 +166,13 @@ export const duplicateVariantCollectionCsv = `Id,Name,Set,Color,Rarity,Count,Pri
 2001,"Ajani's Pridemate",AAA,White,Uncommon,4,0
 2002,"Ajani's Pridemate",BBB,White,Uncommon,4,4
 `;
+
+export const untappedCollectionJson = JSON.stringify(
+  {
+    1001: 2,
+    1002: 1,
+    9999: 4
+  },
+  null,
+  2
+);
