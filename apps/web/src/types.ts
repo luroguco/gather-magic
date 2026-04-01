@@ -121,3 +121,68 @@ export type AppStatus = {
     total: number;
   };
 };
+
+export type UntappedImportSummary = {
+  source: "untapped-json";
+  importedAt?: string;
+  extractedPath: string;
+  catalogSource: "database" | "untapped-public";
+  catalogMetadata?: {
+    build?: string | null;
+    locale?: string;
+  };
+  rawEntryCount: number;
+  matchedGrpIds: number;
+  unmatchedGrpIds: number;
+  unmatchedEntries: Array<{
+    grpId: number;
+    quantity: number;
+  }>;
+  cardsMatched: number;
+  ownedTitles: number;
+  ownedCopies: number;
+  rawOwnedCopies: number;
+  unresolvedCards: Array<{
+    name: string;
+    titleCount: number;
+    printCount: number;
+    reason: string;
+  }>;
+  diff: {
+    addedTitles: number;
+    removedTitles: number;
+    changedTitles: number;
+    unchangedTitles: number;
+  };
+};
+
+export type UntappedCaptureFile = {
+  path: string;
+  filename: string;
+  size: number;
+  modifiedAt: string;
+};
+
+export type UntappedCaptureStatus = {
+  available: boolean;
+  configPath: string;
+  downloadsPath: string;
+  showDevTools: boolean | null;
+  latestCapture: UntappedCaptureFile | null;
+  snippet: string;
+};
+
+export type UntappedCaptureStartResult = {
+  changed: boolean;
+  status: Omit<UntappedCaptureStatus, "snippet">;
+  snippet: string;
+};
+
+export type UntappedCaptureStopResult = {
+  changed: boolean;
+  status: Omit<UntappedCaptureStatus, "snippet">;
+};
+
+export type UntappedCaptureImportSummary = UntappedImportSummary & {
+  capture: UntappedCaptureFile;
+};

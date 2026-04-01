@@ -17,13 +17,32 @@ import {
   getDeck,
   getMechanics,
   getStatus,
+  getUntappedHelperStatus,
+  importUntappedCollection,
+  importLatestUntappedCapture,
   listDecks,
+  previewUntappedCollection,
+  previewLatestUntappedCapture,
+  startUntappedHelper,
+  stopUntappedHelper,
   searchCards,
   updateDeck,
   uploadCollection,
   validateDeck
 } from "./api";
-import type { AppStatus, CardDetail, CardSummary, Deck, DeckCard, DeckListItem, Mechanic, ValidationResult } from "./types";
+import type {
+  AppStatus,
+  CardDetail,
+  CardSummary,
+  Deck,
+  DeckCard,
+  DeckListItem,
+  UntappedCaptureFile,
+  UntappedCaptureStatus,
+  Mechanic,
+  UntappedImportSummary,
+  ValidationResult
+} from "./types";
 
 const FORMATS = [
   ["standard", "Standard"],
@@ -67,6 +86,20 @@ const THEME_OPTIONS = [
   { value: "coast", label: "Coast", tone: "light" },
   { value: "mountain", label: "Mountain", tone: "light" }
 ] as const;
+
+const UNTAPPED_CAPTURE_SNIPPET = `(async () => {
+  const collection = await window.electron.ipcRenderer.invoke("mtga.collection.invoke");
+  const total = Object.values(collection ?? {}).reduce((sum, value) => sum + Number(value || 0), 0);
+  console.log("mtga.collection entries:", Object.keys(collection ?? {}).length);
+  console.log("mtga.collection total quantity:", total);
+  const blob = new Blob([JSON.stringify(collection, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "untapped-mtga-collection.json";
+  a.click();
+  URL.revokeObjectURL(url);
+})();`;
 
 const derivedBucketLabels: Record<string, string> = {
   advantage: "Card Advantage",
@@ -258,6 +291,19 @@ const mergeDeckCard = (
 const formatDateTime = (value: string | null) =>
   value ? new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(new Date(value)) : "Never";
 
+const formatCatalogLabel = (preview: UntappedImportSummary | null) => {
+  if (!preview) {
+    return "Pending preview";
+  }
+
+  if (preview.catalogSource === "database") {
+    return "Local catalog";
+  }
+
+  const buildLabel = preview.catalogMetadata?.build ? ` build ${preview.catalogMetadata.build}` : "";
+  return `Untapped public${buildLabel}`;
+};
+
 const formatOwnedCount = (card: CardSummary) => {
   if (card.rawOwnedCount <= 0) {
     return "0 owned";
@@ -284,6 +330,14 @@ type PendingAdd = {
   section: DeckCard["section"];
 };
 
+type UntappedPreviewSource = "manual-file" | "latest-capture";
+
+const formatFileSize = (size: number) =>
+  size >= 1024 ? `${(size / 1024).toFixed(1)} KB` : `${size} B`;
+
+const getUntappedCaptureIdentity = (capture: UntappedCaptureFile | null) =>
+  capture ? `${capture.path}::${capture.modifiedAt}` : null;
+
 function App() {
   const [status, setStatus] = useState<AppStatus | null>(null);
   const [mechanics, setMechanics] = useState<Mechanic[]>([]);
@@ -304,6 +358,15 @@ function App() {
   const [quickDeckFormat, setQuickDeckFormat] = useState<Deck["format"]>("standard");
   const [importMessage, setImportMessage] = useState("");
   const [errorMessage, setErrorMessage] = useState("");
+  const [untappedFile, setUntappedFile] = useState<File | null>(null);
+  const [untappedPreview, setUntappedPreview] = useState<UntappedImportSummary | null>(null);
+  const [untappedPreviewLoading, setUntappedPreviewLoading] = useState(false);
+  const [untappedImporting, setUntappedImporting] = useState(false);
+  const [untappedHelperStatus, setUntappedHelperStatus] = useState<UntappedCaptureStatus | null>(null);
+  const [untappedHelperLoading, setUntappedHelperLoading] = useState(false);
+  const [untappedGuideActive, setUntappedGuideActive] = useState(false);
+  const [untappedPreviewSource, setUntappedPreviewSource] = useState<UntappedPreviewSource | null>(null);
+  const [lastAutoPreviewedCaptureId, setLastAutoPreviewedCaptureId] = useState<string | null>(null);
   const [glossaryOpen, setGlossaryOpen] = useState(false);
   const [glossaryQuery, setGlossaryQuery] = useState("");
   const [deckDrawerOpen, setDeckDrawerOpen] = useState(false);
@@ -362,6 +425,32 @@ function App() {
   const loadStatus = async () => {
     const nextStatus = await getStatus();
     setStatus(nextStatus);
+  };
+
+  const refreshUntappedHelperStatus = async () => {
+    const nextStatus = await getUntappedHelperStatus();
+    setUntappedHelperStatus(nextStatus);
+    return nextStatus;
+  };
+
+  const copyUntappedSnippetToClipboard = async (snippet: string) => {
+    if (typeof navigator === "undefined" || !navigator.clipboard?.writeText) {
+      return false;
+    }
+
+    try {
+      await navigator.clipboard.writeText(snippet);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  const refreshCollectionViewsAfterImport = async () => {
+    await loadStatus();
+    startTransition(() => {
+      setSearchState((current) => ({ ...current }));
+    });
   };
 
   const loadDecks = async (selectDeckId?: string) => {
@@ -461,6 +550,79 @@ function App() {
       window.requestAnimationFrame(restore);
     });
   }, [activeTab]);
+
+  useEffect(() => {
+    if (activeTab !== "import") {
+      return;
+    }
+
+    void refreshUntappedHelperStatus().catch((error) => {
+      setErrorMessage(error instanceof Error ? error.message : "Failed to load Untapped helper status.");
+    });
+  }, [activeTab]);
+
+  useEffect(() => {
+    if (activeTab !== "import" || !untappedGuideActive || typeof window === "undefined") {
+      return;
+    }
+
+    let cancelled = false;
+
+    const poll = async () => {
+      try {
+        const nextStatus = await getUntappedHelperStatus();
+        if (cancelled) {
+          return;
+        }
+
+        setUntappedHelperStatus(nextStatus);
+        if (!nextStatus.showDevTools) {
+          setUntappedGuideActive(false);
+        }
+
+        const latestCaptureId = getUntappedCaptureIdentity(nextStatus.latestCapture);
+        if (!latestCaptureId || latestCaptureId === lastAutoPreviewedCaptureId) {
+          return;
+        }
+
+        setLastAutoPreviewedCaptureId(latestCaptureId);
+        setUntappedPreviewLoading(true);
+        try {
+          const preview = await previewLatestUntappedCapture();
+          if (cancelled) {
+            return;
+          }
+
+          setUntappedFile(null);
+          setUntappedPreview(preview);
+          setUntappedPreviewSource("latest-capture");
+          setImportMessage(`Detected new Untapped capture: ${preview.capture.filename}. Preview updated automatically.`);
+        } catch (error) {
+          if (!cancelled) {
+            setErrorMessage(error instanceof Error ? error.message : "Failed to preview the latest Untapped capture.");
+          }
+        } finally {
+          if (!cancelled) {
+            setUntappedPreviewLoading(false);
+          }
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setErrorMessage(error instanceof Error ? error.message : "Failed to poll Untapped capture status.");
+        }
+      }
+    };
+
+    void poll();
+    const intervalId = window.setInterval(() => {
+      void poll();
+    }, 2500);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+    };
+  }, [activeTab, lastAutoPreviewedCaptureId, untappedGuideActive]);
 
   const saveDeck = async (deck: Deck) => {
     const saved = await updateDeck(deck.id, {
@@ -573,12 +735,145 @@ function App() {
         `Imported ${result.ownedCopies} owned copies across ${result.cardsMatched} cards. ` +
           `${result.unresolvedRows.length} rows could not be matched.`
       );
-      await loadStatus();
-      startTransition(() => {
-        setSearchState((current) => ({ ...current }));
-      });
+      await refreshCollectionViewsAfterImport();
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : "Collection import failed.");
+    }
+  };
+
+  const handleStartUntappedGuide = async () => {
+    try {
+      setErrorMessage("");
+      setImportMessage("");
+      setUntappedHelperLoading(true);
+      const result = await startUntappedHelper();
+      const nextStatus = {
+        ...result.status,
+        snippet: result.snippet
+      };
+      setUntappedHelperStatus(nextStatus);
+      setUntappedGuideActive(true);
+      setLastAutoPreviewedCaptureId(getUntappedCaptureIdentity(nextStatus.latestCapture));
+
+      const copied = await copyUntappedSnippetToClipboard(result.snippet);
+      setImportMessage(
+        copied
+          ? "Untapped guided capture started. The DevTools snippet is in your clipboard."
+          : "Untapped guided capture started. Clipboard copy failed, so paste the snippet shown below manually."
+      );
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : "Failed to start the Untapped guided capture.");
+    } finally {
+      setUntappedHelperLoading(false);
+    }
+  };
+
+  const handleStopUntappedGuide = async () => {
+    try {
+      setErrorMessage("");
+      setUntappedHelperLoading(true);
+      const result = await stopUntappedHelper();
+      setUntappedGuideActive(false);
+      setUntappedHelperStatus((current) => ({
+        ...(current ?? { snippet: UNTAPPED_CAPTURE_SNIPPET }),
+        ...result.status
+      }));
+      setImportMessage("Untapped guided capture stopped. DevTools can be closed after restarting Companion.");
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : "Failed to stop the Untapped guided capture.");
+    } finally {
+      setUntappedHelperLoading(false);
+    }
+  };
+
+  const handleCopyUntappedSnippet = async () => {
+    const snippet = untappedHelperStatus?.snippet ?? UNTAPPED_CAPTURE_SNIPPET;
+    const copied = await copyUntappedSnippetToClipboard(snippet);
+    if (copied) {
+      setImportMessage("Untapped DevTools snippet copied to clipboard.");
+      return;
+    }
+
+    setErrorMessage("Clipboard access failed. Paste the snippet from the panel below manually.");
+  };
+
+  const handlePreviewLatestUntappedCapture = async () => {
+    try {
+      setErrorMessage("");
+      setImportMessage("");
+      setUntappedPreviewLoading(true);
+      const preview = await previewLatestUntappedCapture();
+      setUntappedFile(null);
+      setUntappedPreview(preview);
+      setUntappedPreviewSource("latest-capture");
+      setLastAutoPreviewedCaptureId(getUntappedCaptureIdentity(preview.capture));
+      setImportMessage(`Previewed ${preview.capture.filename} from your Downloads folder.`);
+      await refreshUntappedHelperStatus();
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : "Failed to preview the latest Untapped capture.");
+    } finally {
+      setUntappedPreviewLoading(false);
+    }
+  };
+
+  const handleUntappedPreview = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) {
+      return;
+    }
+
+    try {
+      setErrorMessage("");
+      setImportMessage("");
+      setUntappedFile(file);
+      setUntappedPreview(null);
+      setUntappedPreviewSource("manual-file");
+      setUntappedPreviewLoading(true);
+      const preview = await previewUntappedCollection(file);
+      setUntappedPreview(preview);
+    } catch (error) {
+      setUntappedFile(null);
+      setUntappedPreview(null);
+      setUntappedPreviewSource(null);
+      setErrorMessage(error instanceof Error ? error.message : "Untapped preview failed.");
+    } finally {
+      setUntappedPreviewLoading(false);
+    }
+  };
+
+  const handleConfirmUntappedImport = async () => {
+    if (!untappedPreviewSource) {
+      return;
+    }
+
+    try {
+      setErrorMessage("");
+      setImportMessage("");
+      setUntappedImporting(true);
+      let result: UntappedImportSummary;
+
+      if (untappedPreviewSource === "latest-capture") {
+        const latestResult = await importLatestUntappedCapture();
+        setLastAutoPreviewedCaptureId(getUntappedCaptureIdentity(latestResult.capture));
+        result = latestResult;
+      } else if (untappedFile) {
+        result = await importUntappedCollection(untappedFile);
+      } else {
+        throw new Error("Choose an Untapped JSON file or preview the latest capture before importing.");
+      }
+
+      setUntappedPreview(result);
+      setImportMessage(
+        `Imported ${result.ownedCopies} playable copies across ${result.ownedTitles} titles from Untapped Companion. ` +
+          `${result.unresolvedCards.length} local matches unresolved, ${result.unmatchedGrpIds} grpIds unmatched.`
+      );
+      await refreshCollectionViewsAfterImport();
+      await refreshUntappedHelperStatus();
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : "Untapped import failed.");
+    } finally {
+      setUntappedImporting(false);
     }
   };
 
@@ -1647,26 +1942,8 @@ function App() {
         ) : null}
 
         {activeTab === "import" ? (
-          <div className="workspace-grid">
-            <section className="panel import-panel">
-              <div className="panel-header">
-                <h2>Collection Import</h2>
-                <span>Manual Arena CSV upload</span>
-              </div>
-
-              <p className="hero-copy">
-                Upload an MTG Arena collection export. The new file replaces the current ownership
-                snapshot atomically.
-              </p>
-
-              <label className="upload-drop">
-                <input accept=".csv,text/csv" onChange={handleImport} type="file" />
-                <span>Choose your Arena collection CSV</span>
-                <small>Required columns: Id, Name, Set, Color, Rarity, Count, PrintCount</small>
-              </label>
-            </section>
-
-            <section className="panel import-panel">
+          <div className="workspace-grid import-workspace">
+            <section className="panel import-panel snapshot-panel">
               <div className="panel-header">
                 <h2>Current Snapshot</h2>
                 <span>Collection status</span>
@@ -1698,6 +1975,243 @@ function App() {
                 </div>
               </div>
             </section>
+
+            <div className="import-stack">
+              <section className="panel import-panel">
+                <div className="panel-header">
+                  <h2>Untapped Companion</h2>
+                  <span>Safe bridge import</span>
+                </div>
+
+                <p className="hero-copy">
+                  Capture a local <code>mtga.collection</code> JSON dump from Untapped Companion,
+                  preview it here, then replace your current collection snapshot.
+                </p>
+
+                <div className="helper-toolbar">
+                  <button
+                    className="primary-button"
+                    disabled={untappedHelperLoading}
+                    onClick={handleStartUntappedGuide}
+                    type="button"
+                  >
+                    {untappedHelperLoading ? "Starting..." : "Start guided capture"}
+                  </button>
+                  <button className="ghost-button" onClick={handleCopyUntappedSnippet} type="button">
+                    Copy snippet
+                  </button>
+                  <button
+                    className="ghost-button"
+                    disabled={!untappedHelperStatus?.latestCapture || untappedPreviewLoading}
+                    onClick={handlePreviewLatestUntappedCapture}
+                    type="button"
+                  >
+                    Preview latest download
+                  </button>
+                  <button
+                    className="ghost-button"
+                    disabled={untappedHelperLoading || !untappedHelperStatus?.showDevTools}
+                    onClick={handleStopUntappedGuide}
+                    type="button"
+                  >
+                    Stop guided capture
+                  </button>
+                </div>
+
+                <p className="helper-note">
+                  Guided mode enables Untapped DevTools, watches your Downloads folder, and previews
+                  the next capture automatically after the JSON download finishes.
+                </p>
+
+                {untappedHelperStatus ? (
+                  <div className="subpanel helper-status-panel">
+                    <div className="panel-header">
+                      <h3>Local helper status</h3>
+                      <span>{untappedGuideActive ? "Watching for new captures" : "Idle"}</span>
+                    </div>
+                    <div className="snapshot-grid helper-status-grid">
+                      <div className="stat-card dense">
+                        <span>DevTools</span>
+                        <strong>{untappedHelperStatus.showDevTools ? "Enabled" : "Disabled"}</strong>
+                      </div>
+                      <div className="stat-card dense">
+                        <span>Helper</span>
+                        <strong>{untappedHelperStatus.available ? "Ready" : "Unavailable"}</strong>
+                      </div>
+                      <div className="stat-card dense">
+                        <span>Latest capture</span>
+                        <strong>{untappedHelperStatus.latestCapture ? untappedHelperStatus.latestCapture.filename : "None yet"}</strong>
+                      </div>
+                      <div className="stat-card dense">
+                        <span>Updated</span>
+                        <strong>
+                          {untappedHelperStatus.latestCapture
+                            ? formatDateTime(untappedHelperStatus.latestCapture.modifiedAt)
+                            : "Waiting"}
+                        </strong>
+                      </div>
+                    </div>
+
+                    <div className="helper-path-list">
+                      <p>
+                        <strong>Downloads:</strong> <code>{untappedHelperStatus.downloadsPath}</code>
+                      </p>
+                      <p>
+                        <strong>Config:</strong> <code>{untappedHelperStatus.configPath}</code>
+                      </p>
+                      {untappedHelperStatus.latestCapture ? (
+                        <p>
+                          <strong>Latest file:</strong> <code>{untappedHelperStatus.latestCapture.path}</code> (
+                          {formatFileSize(untappedHelperStatus.latestCapture.size)})
+                        </p>
+                      ) : null}
+                    </div>
+                  </div>
+                ) : null}
+
+                <ol className="import-steps">
+                  <li>Open Untapped Companion and MTGA Deck Builder.</li>
+                  <li>Open Untapped DevTools and run this console snippet.</li>
+                  <li>Wait for the download or upload the JSON manually if the watcher misses it.</li>
+                </ol>
+
+                <pre className="capture-snippet">
+                  <code>{untappedHelperStatus?.snippet ?? UNTAPPED_CAPTURE_SNIPPET}</code>
+                </pre>
+
+                <label className="upload-drop">
+                  <input accept=".json,application/json" onChange={handleUntappedPreview} type="file" />
+                  <span>{untappedFile ? untappedFile.name : "Choose your Untapped collection JSON"}</span>
+                  <small>
+                    Raw <code>grpId -&gt; quantity</code> map exported from the Untapped renderer.
+                  </small>
+                </label>
+
+                {untappedPreviewLoading ? (
+                  <p className="empty-state">Previewing Untapped collection...</p>
+                ) : null}
+
+                {untappedPreview ? (
+                  <div className="untapped-preview">
+                    <div className="panel-header preview-header">
+                      <div>
+                        <h3>Preview</h3>
+                        <span>
+                          {formatCatalogLabel(untappedPreview)}
+                          {untappedPreviewSource === "latest-capture" && untappedHelperStatus?.latestCapture
+                            ? ` · ${untappedHelperStatus.latestCapture.filename}`
+                            : ""}
+                        </span>
+                      </div>
+                      <button
+                        className="primary-button"
+                        disabled={untappedImporting}
+                        onClick={handleConfirmUntappedImport}
+                        type="button"
+                      >
+                        {untappedImporting ? "Importing..." : "Confirm import"}
+                      </button>
+                    </div>
+
+                    <div className="snapshot-grid import-preview-grid">
+                      <div className="stat-card dense">
+                        <span>Owned titles</span>
+                        <strong>{untappedPreview.ownedTitles}</strong>
+                      </div>
+                      <div className="stat-card dense">
+                        <span>Playable copies</span>
+                        <strong>{untappedPreview.ownedCopies}</strong>
+                      </div>
+                      <div className="stat-card dense">
+                        <span>Variant copies</span>
+                        <strong>{untappedPreview.rawOwnedCopies}</strong>
+                      </div>
+                      <div className="stat-card dense">
+                        <span>Matched grpIds</span>
+                        <strong>{untappedPreview.matchedGrpIds}</strong>
+                      </div>
+                      <div className="stat-card dense">
+                        <span>Unmatched grpIds</span>
+                        <strong>{untappedPreview.unmatchedGrpIds}</strong>
+                      </div>
+                      <div className="stat-card dense">
+                        <span>Extracted path</span>
+                        <strong>{untappedPreview.extractedPath}</strong>
+                      </div>
+                    </div>
+
+                    <div className="snapshot-grid import-diff-grid">
+                      <div className="stat-card dense">
+                        <span>Added titles</span>
+                        <strong>{untappedPreview.diff.addedTitles}</strong>
+                      </div>
+                      <div className="stat-card dense">
+                        <span>Removed titles</span>
+                        <strong>{untappedPreview.diff.removedTitles}</strong>
+                      </div>
+                      <div className="stat-card dense">
+                        <span>Changed titles</span>
+                        <strong>{untappedPreview.diff.changedTitles}</strong>
+                      </div>
+                      <div className="stat-card dense">
+                        <span>Unchanged titles</span>
+                        <strong>{untappedPreview.diff.unchangedTitles}</strong>
+                      </div>
+                    </div>
+
+                    {untappedPreview.unresolvedCards.length ? (
+                      <div className="subpanel import-warning-panel">
+                        <div className="panel-header">
+                          <h3>Unresolved local matches</h3>
+                          <span>{untappedPreview.unresolvedCards.length}</span>
+                        </div>
+                        <ul className="issue-list">
+                          {untappedPreview.unresolvedCards.slice(0, 6).map((entry) => (
+                            <li key={entry.name}>
+                              {entry.name}: {entry.titleCount} playable, {entry.printCount} variant copies
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    ) : null}
+
+                    {untappedPreview.unmatchedEntries.length ? (
+                      <div className="subpanel import-warning-panel">
+                        <div className="panel-header">
+                          <h3>Catalog misses</h3>
+                          <span>{untappedPreview.unmatchedEntries.length}</span>
+                        </div>
+                        <ul className="issue-list">
+                          {untappedPreview.unmatchedEntries.slice(0, 6).map((entry) => (
+                            <li key={entry.grpId}>
+                              grpId {entry.grpId}: qty {entry.quantity}
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    ) : null}
+                  </div>
+                ) : null}
+              </section>
+
+              <section className="panel import-panel">
+                <div className="panel-header">
+                  <h2>Collection CSV</h2>
+                  <span>Fallback import</span>
+                </div>
+
+                <p className="hero-copy">
+                  Upload an MTG Arena collection export. The new file replaces the current ownership
+                  snapshot atomically.
+                </p>
+
+                <label className="upload-drop">
+                  <input accept=".csv,text/csv" onChange={handleImport} type="file" />
+                  <span>Choose your Arena collection CSV</span>
+                  <small>Required columns: Id, Name, Set, Color, Rarity, Count, PrintCount</small>
+                </label>
+              </section>
+            </div>
           </div>
         ) : null}
       </main>
@@ -1705,7 +2219,7 @@ function App() {
       {glossaryOpen ? (
         <div className="modal-shell" onClick={() => setGlossaryOpen(false)} role="presentation">
           <div
-            className="modal-card"
+            className="modal-card glossary-modal"
             onClick={(event) => event.stopPropagation()}
             role="dialog"
             aria-modal="true"

@@ -28,6 +28,35 @@ export const uploadCollection = async (file) => {
         body: formData
     });
 };
+export const previewUntappedCollection = async (file) => {
+    const formData = new FormData();
+    formData.append("file", file);
+    return request("/api/imports/untapped-json/preview", {
+        method: "POST",
+        body: formData
+    });
+};
+export const importUntappedCollection = async (file) => {
+    const formData = new FormData();
+    formData.append("file", file);
+    return request("/api/imports/untapped-json", {
+        method: "POST",
+        body: formData
+    });
+};
+export const getUntappedHelperStatus = () => request("/api/imports/untapped-helper/status");
+export const startUntappedHelper = () => request("/api/imports/untapped-helper/start", {
+    method: "POST"
+});
+export const stopUntappedHelper = () => request("/api/imports/untapped-helper/stop", {
+    method: "POST"
+});
+export const previewLatestUntappedCapture = () => request("/api/imports/untapped-helper/preview-latest", {
+    method: "POST"
+});
+export const importLatestUntappedCapture = () => request("/api/imports/untapped-helper/import-latest", {
+    method: "POST"
+});
 export const listDecks = async () => (await request("/api/decks")).items;
 export const getDeck = (id) => request(`/api/decks/${id}`);
 export const createDeck = (payload) => request("/api/decks", {

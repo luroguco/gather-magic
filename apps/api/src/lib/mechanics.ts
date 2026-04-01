@@ -13,46 +13,74 @@ const textIncludesAny = (text: string, values: string[]): boolean =>
   values.some((value) => text.includes(value));
 
 const keywordDefinitions: Record<string, string> = {
-  flying: "Can only be blocked by creatures with flying or reach.",
-  trample: "Excess combat damage can be assigned to the defending player or permanent.",
-  vigilance: "Attacking does not cause the creature to tap.",
-  haste: "The creature can attack and use tap abilities as soon as it comes under your control.",
-  flash: "You can cast the spell any time you could cast an instant.",
-  lifelink: "Damage dealt by this source also causes its controller to gain that much life.",
-  deathtouch: "Any amount of damage this deals to a creature is enough to destroy it.",
-  menace: "The creature can't be blocked except by two or more creatures.",
+  flying: "A creature with flying can be blocked only by creatures with flying or reach.",
+  trample:
+    "This creature can deal excess combat damage to the player or permanent it is attacking.",
+  vigilance: "Attacking doesn't cause this creature to tap.",
+  haste:
+    "This creature isn't affected by summoning sickness. It can attack and use tap abilities as soon as it comes under your control.",
+  flash: "You may cast this spell any time you could cast an instant.",
+  lifelink: "Damage dealt by a source with lifelink also causes its controller to gain that much life.",
+  deathtouch:
+    "Any nonzero amount of combat damage this deals to a creature is enough to destroy it.",
+  menace: "This creature can't be blocked except by two or more creatures.",
   reach: "This creature can block creatures with flying.",
-  "first-strike": "This creature deals combat damage before creatures without first strike.",
+  "first-strike":
+    "This creature deals combat damage before creatures without first strike or double strike.",
   "double-strike": "This creature deals both first-strike and regular combat damage.",
-  ward: "Counter or tax effect that applies unless the opponent pays the ward cost.",
-  hexproof: "This permanent can't be the target of spells or abilities your opponents control.",
-  indestructible: "Effects that say destroy do not destroy this permanent.",
+  ward:
+    "Whenever this permanent becomes the target of a spell or ability an opponent controls, counter that spell or ability unless that player pays the ward cost.",
+  hexproof:
+    "This permanent or player can't be the target of spells or abilities opponents control.",
+  indestructible:
+    "This permanent can't be destroyed by damage or by effects that say 'destroy.'",
   defender: "This creature can't attack.",
-  scry: "Look at cards from the top of your library, then put any number on the bottom and the rest on top.",
-  surveil: "Look at cards from the top of your library, put any number into your graveyard and the rest back on top.",
-  mill: "Put cards from the top of a library into a graveyard.",
-  equip: "Attach this Equipment to a creature you control for the equip cost at sorcery speed.",
-  enchant: "This Aura can only be attached to the type of object named after enchant.",
-  cycling: "Pay the cycling cost, discard the card, and draw a card.",
-  kicker: "You may pay an additional kicker cost as you cast the spell for a bonus effect.",
-  flashback: "You may cast this card from your graveyard for its flashback cost, then exile it.",
-  protection: "Prevents damage, enchanting/equipping, blocking, and targeting from the stated quality.",
-  treasure: "A Treasure token can be sacrificed for one mana of any color.",
-  transform: "This card can turn to its other face when the transform condition is met.",
-  convoke: "Your creatures can help cast the spell by tapping for mana or generic costs.",
-  prowess: "Gets +1/+1 until end of turn when you cast a noncreature spell.",
-  toxic: "Players dealt combat damage by this creature get that many poison counters.",
-  infect: "Deals damage to creatures as -1/-1 counters and to players as poison counters.",
-  casualty: "You may sacrifice a creature of the stated power as an additional cost to copy the spell.",
-  disturb: "You may cast this from your graveyard transformed for its disturb cost.",
-  bargain: "You may sacrifice an artifact, enchantment, or token as you cast the spell for an extra effect.",
-  descend: "Checks whether cards went to your graveyard from anywhere this turn or how many permanents are there.",
-  spree: "Choose one or more additional modes and pay each added cost.",
-  offspring: "Pay the offspring cost as you cast to also create a 1/1 token copy.",
-  gift: "You may give the stated benefit to an opponent for an additional effect.",
-  discover: "Exile cards until you hit a nonland of the stated mana value or less; cast it or put it in hand.",
-  disguise: "You may cast this face down as a 2/2 creature, then turn it face up for its disguise cost.",
-  plot: "Pay the plot cost to exile the card and cast it later as a sorcery without paying mana."
+  scry:
+    "Look at the stated number of cards from the top of your library. Put any number on the bottom and the rest on top in any order.",
+  surveil:
+    "Look at the stated number of cards from the top of your library. Put any number into your graveyard and the rest back on top in any order.",
+  mill: "Put that many cards from the top of a library into its owner's graveyard.",
+  equip:
+    "Attach this Equipment to target creature you control. Equip only as a sorcery.",
+  enchant:
+    "An Aura with enchant can be attached only to the kind of object named after enchant.",
+  cycling: "Pay the cycling cost, discard this card, and draw a card.",
+  kicker:
+    "You may pay an additional kicker cost as you cast this spell for an added effect.",
+  flashback:
+    "You may cast this card from your graveyard by paying its flashback cost. If you do, exile it instead of putting it anywhere else any time it would leave the stack.",
+  protection:
+    "Protection from a quality means it can't be damaged, enchanted or equipped, blocked, or targeted by anything with that quality.",
+  treasure:
+    "Treasure is an artifact token with '{T}, Sacrifice this artifact: Add one mana of any color.'",
+  transform: "A transforming permanent can turn to its other face when an effect or ability instructs it to transform.",
+  convoke:
+    "Your creatures can help cast this spell. Each creature you tap while casting it pays for {1} or one mana of that creature's color.",
+  prowess:
+    "Whenever you cast a noncreature spell, this creature gets +1/+1 until end of turn.",
+  toxic:
+    "Combat damage dealt to a player by this creature causes that many poison counters, in addition to the damage's other results.",
+  infect:
+    "Damage dealt to players by this source is dealt as poison counters, and damage dealt to creatures by this source is dealt as -1/-1 counters.",
+  casualty:
+    "As an additional cost to cast this spell, you may sacrifice a creature with the stated power or greater. When you cast it, if that casualty cost was paid, copy it.",
+  disturb:
+    "You may cast this double-faced card transformed from your graveyard by paying its disturb cost rather than its mana cost.",
+  bargain:
+    "As an additional cost to cast this spell, you may sacrifice an artifact, enchantment, or token.",
+  descend:
+    "Descend is an ability word that checks whether cards were put into your graveyard this turn or how many permanents are in your graveyard.",
+  spree: "Choose one or more additional modes and pay each mode's additional cost.",
+  offspring:
+    "You may pay the offspring cost as you cast this spell. If you do, when this permanent enters, create a 1/1 token copy of it if it's a creature.",
+  gift:
+    "You may promise the stated gift to an opponent as you cast this spell. If you do, that player gets the stated benefit and the spell gains the listed bonus effect.",
+  discover:
+    "Exile cards from the top of your library until you exile a nonland card with the stated mana value or less. You may cast it without paying its mana cost or put it into your hand. Put the rest on the bottom in a random order.",
+  disguise:
+    "You may cast this card face down as a 2/2 creature with ward {2} for {3}, then turn it face up for its disguise cost.",
+  plot:
+    "You may pay the plot cost and exile this card as a sorcery. On a later turn, you may cast it from exile as a sorcery without paying its mana cost."
 };
 
 export const derivedMechanicRules: DerivedRule[] = [

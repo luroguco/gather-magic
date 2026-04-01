@@ -7,6 +7,13 @@ import { ARENA_FORMATS } from "./lib/formats.js";
 import { importCollectionCsv } from "./services/collectionImport.js";
 import { getCardById, getCollectionSummary, listMechanics, searchCards } from "./services/cardsRepository.js";
 import { createDeck, exportDeckForArena, getDeck, listDecks, updateDeck, validateDeck } from "./services/decks.js";
+import {
+  UNTAPPED_CAPTURE_SNIPPET,
+  getUntappedCaptureStatus,
+  readLatestUntappedCapture,
+  setUntappedDevToolsEnabled
+} from "./services/untappedCaptureHelper.js";
+import { importUntappedCollectionJson, previewUntappedCollectionImport, type UntappedCatalogSource } from "./services/untappedCollectionImport.js";
 
 const MAX_SEARCH_PAGE_SIZE = 50_000;
 
@@ -71,10 +78,28 @@ const updateDeckSchema = z.object({
 const splitCsvParam = (value?: string) =>
   value?.split(",").map((entry) => entry.trim()).filter(Boolean) ?? undefined;
 
-export const buildApp = (db: DbHandle = createDatabase()) => {
+export const buildApp = (
+  db: DbHandle = createDatabase(),
+  options?: {
+    untappedCatalogSource?: UntappedCatalogSource;
+    untappedBuild?: string;
+    untappedLocale?: string;
+    untappedConfigPath?: string;
+    untappedDownloadsPath?: string;
+  }
+) => {
   const app = Fastify({
     logger: false
   });
+  const untappedImportOptions = {
+    catalogSource: options?.untappedCatalogSource ?? "untapped-public",
+    ...(options?.untappedBuild ? { untappedBuild: options.untappedBuild } : {}),
+    ...(options?.untappedLocale ? { untappedLocale: options.untappedLocale } : {})
+  };
+  const untappedHelperOptions = {
+    ...(options?.untappedConfigPath ? { configPath: options.untappedConfigPath } : {}),
+    ...(options?.untappedDownloadsPath ? { downloadsPath: options.untappedDownloadsPath } : {})
+  };
 
   app.register(cors, {
     origin: true
@@ -137,6 +162,70 @@ export const buildApp = (db: DbHandle = createDatabase()) => {
     const csvContent = await file.toBuffer();
     const result = importCollectionCsv(db, csvContent.toString("utf8"));
     return result;
+  });
+
+  app.post("/api/imports/untapped-json/preview", async (request, reply) => {
+    const file = await request.file();
+    if (!file) {
+      reply.code(400);
+      return { error: "Expected a multipart file field." };
+    }
+
+    const jsonContent = await file.toBuffer();
+    return previewUntappedCollectionImport(db, jsonContent.toString("utf8"), untappedImportOptions);
+  });
+
+  app.post("/api/imports/untapped-json", async (request, reply) => {
+    const file = await request.file();
+    if (!file) {
+      reply.code(400);
+      return { error: "Expected a multipart file field." };
+    }
+
+    const jsonContent = await file.toBuffer();
+    return importUntappedCollectionJson(db, jsonContent.toString("utf8"), untappedImportOptions);
+  });
+
+  app.get("/api/imports/untapped-helper/status", async () => ({
+    ...getUntappedCaptureStatus(untappedHelperOptions),
+    snippet: UNTAPPED_CAPTURE_SNIPPET
+  }));
+
+  app.post("/api/imports/untapped-helper/start", async () => {
+    const result = setUntappedDevToolsEnabled(true, untappedHelperOptions);
+    return {
+      changed: result.changed,
+      status: result.status,
+      snippet: UNTAPPED_CAPTURE_SNIPPET
+    };
+  });
+
+  app.post("/api/imports/untapped-helper/stop", async () => {
+    const result = setUntappedDevToolsEnabled(false, untappedHelperOptions);
+    return {
+      changed: result.changed,
+      status: result.status
+    };
+  });
+
+  app.post("/api/imports/untapped-helper/preview-latest", async () => {
+    const { capture, content } = readLatestUntappedCapture(untappedHelperOptions);
+    const preview = await previewUntappedCollectionImport(db, content, untappedImportOptions);
+
+    return {
+      ...preview,
+      capture
+    };
+  });
+
+  app.post("/api/imports/untapped-helper/import-latest", async () => {
+    const { capture, content } = readLatestUntappedCapture(untappedHelperOptions);
+    const imported = await importUntappedCollectionJson(db, content, untappedImportOptions);
+
+    return {
+      ...imported,
+      capture
+    };
   });
 
   app.get("/api/decks", async () => ({

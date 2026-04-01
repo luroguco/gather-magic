@@ -1,4 +1,5 @@
 import { readFile } from "node:fs/promises";
+import { gunzipSync } from "node:zlib";
 import { buildMechanicTags } from "../lib/mechanics.js";
 import type { DbHandle } from "../lib/database.js";
 import { ARENA_FORMATS } from "../lib/formats.js";
@@ -66,6 +67,32 @@ type NormalizedCard = {
 };
 
 const SCRYFALL_BULK_INDEX_URL = "https://api.scryfall.com/bulk-data";
+const MTGJSON_ALL_IDENTIFIERS_URL = "https://mtgjson.com/api/v5/AllIdentifiers.json.gz";
+const MTGJSON_SET_BASE_URL = "https://mtgjson.com/api/v5";
+
+type MtgJsonIdentifiers = {
+  mtgArenaId?: string;
+  scryfallId?: string;
+};
+
+type MtgJsonCardSet = {
+  setCode?: string;
+  number?: string;
+  identifiers?: MtgJsonIdentifiers;
+};
+
+type MtgJsonSet = {
+  code?: string;
+  cards?: MtgJsonCardSet[];
+};
+
+type MtgJsonSetDownload = {
+  data?: MtgJsonSet;
+};
+
+export type MtgJsonAllIdentifiers = {
+  data?: Record<string, MtgJsonSet>;
+};
 
 const normalizeName = (value: string) => value.trim().toLowerCase().replace(/\s+/g, " ");
 
@@ -84,6 +111,23 @@ const isArenaPlayableCard = (card: ScryfallCard) => {
   return hasArenaGame || hasArenaId || hasArenaFormatLegality;
 };
 
+export const collectArenaRelevantSetCodes = (cards: ScryfallCard[]) => {
+  const setCodes = new Set<string>();
+
+  for (const card of cards) {
+    if (!isArenaPlayableCard(card)) {
+      continue;
+    }
+
+    const setCode = card.set?.trim().toUpperCase();
+    if (setCode) {
+      setCodes.add(setCode);
+    }
+  }
+
+  return [...setCodes].sort();
+};
+
 const choosePreferredPrint = (prints: NormalizedCard["prints"]) =>
   [...prints].sort((left, right) => {
     const leftDate = left.releasedAt ?? "";
@@ -94,7 +138,112 @@ const choosePreferredPrint = (prints: NormalizedCard["prints"]) =>
     return left.setCode.localeCompare(right.setCode);
   })[0];
 
-export const syncCardsFromBulkData = (db: DbHandle, cards: ScryfallCard[]) => {
+const toSupplementLookupKey = (setCode: string, collectorNumber: string | null) =>
+  collectorNumber ? `${setCode.toUpperCase()}::${collectorNumber.trim()}` : null;
+
+const parseArenaId = (value: string | undefined) => {
+  if (!value) {
+    return null;
+  }
+
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+const buildMtgJsonArenaIdLookup = (payload: MtgJsonAllIdentifiers) => {
+  const byScryfallPrintId = new Map<string, number>();
+  const bySetAndCollectorNumber = new Map<string, number>();
+
+  for (const set of Object.values(payload.data ?? {})) {
+    for (const card of set.cards ?? []) {
+      const arenaId = parseArenaId(card.identifiers?.mtgArenaId);
+      if (arenaId === null) {
+        continue;
+      }
+
+      const scryfallId = card.identifiers?.scryfallId?.toLowerCase();
+      if (scryfallId && !byScryfallPrintId.has(scryfallId)) {
+        byScryfallPrintId.set(scryfallId, arenaId);
+      }
+
+      const lookupKey = toSupplementLookupKey(card.setCode ?? set.code ?? "", card.number ?? null);
+      if (lookupKey && !bySetAndCollectorNumber.has(lookupKey)) {
+        bySetAndCollectorNumber.set(lookupKey, arenaId);
+      }
+    }
+  }
+
+  return {
+    byScryfallPrintId,
+    bySetAndCollectorNumber
+  };
+};
+
+export const supplementArenaIdsFromMtgJson = (
+  normalizedCards: NormalizedCard[],
+  payload: MtgJsonAllIdentifiers
+) => {
+  const lookup = buildMtgJsonArenaIdLookup(payload);
+  const seenArenaIds = new Set<number>();
+
+  for (const card of normalizedCards) {
+    for (const print of card.prints) {
+      if (print.arenaId !== null) {
+        seenArenaIds.add(print.arenaId);
+      }
+    }
+  }
+
+  let supplementedPrints = 0;
+  let matchedByScryfallId = 0;
+  let matchedBySetAndCollectorNumber = 0;
+  let skippedConflictingArenaIds = 0;
+
+  for (const card of normalizedCards) {
+    for (const print of card.prints) {
+      if (print.arenaId !== null) {
+        continue;
+      }
+
+      const byPrintId = lookup.byScryfallPrintId.get(print.printId.toLowerCase()) ?? null;
+      const bySetAndCollector =
+        lookup.bySetAndCollectorNumber.get(toSupplementLookupKey(print.setCode, print.collectorNumber) ?? "") ?? null;
+
+      const candidateArenaId = byPrintId ?? bySetAndCollector;
+      if (candidateArenaId === null) {
+        continue;
+      }
+
+      if (seenArenaIds.has(candidateArenaId)) {
+        skippedConflictingArenaIds += 1;
+        continue;
+      }
+
+      print.arenaId = candidateArenaId;
+      seenArenaIds.add(candidateArenaId);
+      supplementedPrints += 1;
+
+      if (byPrintId !== null) {
+        matchedByScryfallId += 1;
+      } else {
+        matchedBySetAndCollectorNumber += 1;
+      }
+    }
+  }
+
+  return {
+    supplementedPrints,
+    matchedByScryfallId,
+    matchedBySetAndCollectorNumber,
+    skippedConflictingArenaIds
+  };
+};
+
+export const syncCardsFromBulkData = (
+  db: DbHandle,
+  cards: ScryfallCard[],
+  mtgJsonIdentifiers?: MtgJsonAllIdentifiers
+) => {
   const grouped = new Map<string, NormalizedCard>();
   const seenArenaIds = new Set<number>();
 
@@ -194,6 +343,11 @@ export const syncCardsFromBulkData = (db: DbHandle, cards: ScryfallCard[]) => {
       WHERE arena_id = ?
         AND card_id != ?
     `);
+    const deleteCompetingPrints = db.prepare(`
+      DELETE FROM card_prints
+      WHERE print_id = ?
+        AND card_id != ?
+    `);
     const deleteMechanicsForCard = db.prepare(`
       DELETE FROM card_mechanics
       WHERE card_id = ?
@@ -236,6 +390,7 @@ export const syncCardsFromBulkData = (db: DbHandle, cards: ScryfallCard[]) => {
       deleteMechanicsForCard.run(card.id);
 
       for (const print of card.prints) {
+        deleteCompetingPrints.run(print.printId, card.id);
         if (print.arenaId !== null) {
           deleteCompetingArenaPrints.run(print.arenaId, card.id);
         }
@@ -257,10 +412,17 @@ export const syncCardsFromBulkData = (db: DbHandle, cards: ScryfallCard[]) => {
   });
 
   const normalizedCards = [...grouped.values()];
+  const mtgJsonSupplement = mtgJsonIdentifiers
+    ? supplementArenaIdsFromMtgJson(normalizedCards, mtgJsonIdentifiers)
+    : null;
   replaceAll(normalizedCards);
   return {
     cardCount: normalizedCards.length,
-    printCount: normalizedCards.reduce((count, card) => count + card.prints.length, 0)
+    printCount: normalizedCards.reduce((count, card) => count + card.prints.length, 0),
+    supplementedArenaIdCount: mtgJsonSupplement?.supplementedPrints ?? 0,
+    supplementedArenaIdByScryfallIdCount: mtgJsonSupplement?.matchedByScryfallId ?? 0,
+    supplementedArenaIdBySetCollectorCount: mtgJsonSupplement?.matchedBySetAndCollectorNumber ?? 0,
+    skippedConflictingArenaIdCount: mtgJsonSupplement?.skippedConflictingArenaIds ?? 0
   };
 };
 
@@ -300,7 +462,74 @@ const fetchBulkDownloadUri = async () => {
   return defaultCards.download_uri;
 };
 
+export const fetchMtgJsonAllIdentifiers = async (
+  customDownloadUri = MTGJSON_ALL_IDENTIFIERS_URL
+): Promise<MtgJsonAllIdentifiers> => {
+  const response = await fetch(customDownloadUri, {
+    headers: {
+      "User-Agent": "mtga-collection-explorer/0.1",
+      Accept: "application/json;q=0.9,*/*;q=0.8"
+    }
+  });
+
+  if (!response.ok) {
+    throw new Error(`Failed to download MTGJSON identifiers: ${response.status} ${response.statusText}`);
+  }
+
+  const buffer = Buffer.from(await response.arrayBuffer());
+  const content = customDownloadUri.endsWith(".gz") ? gunzipSync(buffer).toString("utf8") : buffer.toString("utf8");
+  return JSON.parse(content) as MtgJsonAllIdentifiers;
+};
+
+const fetchMtgJsonSet = async (setCode: string, customBaseUri = MTGJSON_SET_BASE_URL) => {
+  const normalizedSetCode = setCode.trim().toUpperCase();
+  const response = await fetch(`${customBaseUri}/${normalizedSetCode}.json.gz`, {
+    headers: {
+      "User-Agent": "mtga-collection-explorer/0.1",
+      Accept: "application/json;q=0.9,*/*;q=0.8"
+    }
+  });
+
+  if (response.status === 404) {
+    return null;
+  }
+
+  if (!response.ok) {
+    throw new Error(
+      `Failed to download MTGJSON set ${normalizedSetCode}: ${response.status} ${response.statusText}`
+    );
+  }
+
+  const buffer = Buffer.from(await response.arrayBuffer());
+  const content = gunzipSync(buffer).toString("utf8");
+  const payload = JSON.parse(content) as MtgJsonSetDownload;
+  return payload.data ?? null;
+};
+
+export const fetchMtgJsonSetIdentifiersForCards = async (
+  cards: ScryfallCard[],
+  customBaseUri = MTGJSON_SET_BASE_URL
+): Promise<MtgJsonAllIdentifiers> => {
+  const setCodes = collectArenaRelevantSetCodes(cards);
+  const data: Record<string, MtgJsonSet> = {};
+
+  for (const setCode of setCodes) {
+    const setPayload = await fetchMtgJsonSet(setCode, customBaseUri);
+    if (setPayload) {
+      data[setCode] = setPayload;
+    }
+  }
+
+  return { data };
+};
+
 export const readBulkDataFromFile = async (filename: string) => {
   const content = await readFile(filename, "utf8");
   return JSON.parse(content) as ScryfallCard[];
+};
+
+export const readMtgJsonAllIdentifiersFromFile = async (filename: string) => {
+  const content = await readFile(filename);
+  const parsed = filename.endsWith(".gz") ? gunzipSync(content).toString("utf8") : content.toString("utf8");
+  return JSON.parse(parsed) as MtgJsonAllIdentifiers;
 };

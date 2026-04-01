@@ -5,7 +5,12 @@ import type {
   DeckCard,
   DeckListItem,
   Mechanic,
+  UntappedCaptureImportSummary,
+  UntappedCaptureStartResult,
+  UntappedCaptureStatus,
+  UntappedCaptureStopResult,
   SearchResponse,
+  UntappedImportSummary,
   ValidationResult
 } from "./types";
 
@@ -52,6 +57,47 @@ export const uploadCollection = async (file: File) => {
     body: formData
   });
 };
+
+export const previewUntappedCollection = async (file: File) => {
+  const formData = new FormData();
+  formData.append("file", file);
+  return request<UntappedImportSummary>("/api/imports/untapped-json/preview", {
+    method: "POST",
+    body: formData
+  });
+};
+
+export const importUntappedCollection = async (file: File) => {
+  const formData = new FormData();
+  formData.append("file", file);
+  return request<UntappedImportSummary>("/api/imports/untapped-json", {
+    method: "POST",
+    body: formData
+  });
+};
+
+export const getUntappedHelperStatus = () =>
+  request<UntappedCaptureStatus>("/api/imports/untapped-helper/status");
+
+export const startUntappedHelper = () =>
+  request<UntappedCaptureStartResult>("/api/imports/untapped-helper/start", {
+    method: "POST"
+  });
+
+export const stopUntappedHelper = () =>
+  request<UntappedCaptureStopResult>("/api/imports/untapped-helper/stop", {
+    method: "POST"
+  });
+
+export const previewLatestUntappedCapture = () =>
+  request<UntappedCaptureImportSummary>("/api/imports/untapped-helper/preview-latest", {
+    method: "POST"
+  });
+
+export const importLatestUntappedCapture = () =>
+  request<UntappedCaptureImportSummary>("/api/imports/untapped-helper/import-latest", {
+    method: "POST"
+  });
 
 export const listDecks = async () =>
   (await request<{ items: DeckListItem[] }>("/api/decks")).items;
