@@ -678,6 +678,97 @@ button {
   margin-bottom: 16px;
 }
 
+.toggle-switch {
+  gap: 12px;
+  padding: 12px 14px;
+  border: 1px solid rgba(247, 217, 162, 0.14);
+  border-radius: 18px;
+  background: color-mix(in srgb, var(--surface-soft) 78%, transparent);
+  cursor: pointer;
+  transition:
+    border-color 140ms ease,
+    background 140ms ease,
+    box-shadow 140ms ease,
+    transform 140ms ease;
+}
+
+.toggle-switch:hover {
+  transform: translateY(-1px);
+  border-color: rgba(247, 217, 162, 0.26);
+}
+
+.toggle-switch.active {
+  border-color: rgba(76, 230, 186, 0.62);
+  background: linear-gradient(135deg, rgba(11, 35, 31, 0.9), rgba(12, 54, 73, 0.88));
+  box-shadow: 0 0 0 1px rgba(76, 230, 186, 0.16);
+}
+
+.toggle-switch-input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.toggle-switch-track {
+  position: relative;
+  width: 52px;
+  height: 30px;
+  flex: 0 0 auto;
+  border-radius: 999px;
+  border: 1px solid rgba(247, 217, 162, 0.22);
+  background: rgba(20, 20, 20, 0.38);
+  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.35);
+  transition:
+    background 140ms ease,
+    border-color 140ms ease,
+    box-shadow 140ms ease;
+}
+
+.toggle-switch.active .toggle-switch-track {
+  background: linear-gradient(135deg, #2ad7a4 0%, #1098f7 100%);
+  border-color: rgba(173, 245, 255, 0.9);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.24),
+    0 0 18px rgba(42, 215, 164, 0.24);
+}
+
+.toggle-switch-thumb {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: linear-gradient(180deg, #fffdf7 0%, #e7dcc8 100%);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.34);
+  transition: transform 140ms ease;
+}
+
+.toggle-switch.active .toggle-switch-thumb {
+  transform: translateX(22px);
+}
+
+.toggle-switch-copy {
+  display: grid;
+  gap: 2px;
+}
+
+.toggle-switch-copy strong {
+  font-size: 0.95rem;
+}
+
+.toggle-switch-copy small {
+  color: var(--muted);
+}
+
+.toggle-switch.active .toggle-switch-copy strong {
+  color: #dffff7;
+}
+
+.toggle-switch.active .toggle-switch-copy small {
+  color: rgba(223, 255, 247, 0.82);
+}
+
 .chip-grid {
   display: flex;
   flex-wrap: wrap;
