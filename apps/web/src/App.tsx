@@ -66,7 +66,7 @@ const defaultSearch = {
   types: [] as string[],
   subtypes: "",
   rarity: [] as string[],
-  ownedOnly: true,
+  ownedOnly: false,
   manaValueMin: "",
   manaValueMax: ""
 };
@@ -1319,15 +1319,24 @@ function App() {
                       </select>
                     </label>
 
-                    <label className="inline-toggle">
+                    <label className={searchState.ownedOnly ? "inline-toggle toggle-switch active" : "inline-toggle toggle-switch"}>
                       <input
+                        className="toggle-switch-input"
                         checked={searchState.ownedOnly}
                         onChange={(event) =>
                           setSearchState({ ...searchState, ownedOnly: event.target.checked })
                         }
                         type="checkbox"
                       />
-                      <span>Owned cards only</span>
+                      <span className="toggle-switch-track" aria-hidden="true">
+                        <span className="toggle-switch-thumb" />
+                      </span>
+                      <span className="toggle-switch-copy">
+                        <strong>Owned cards only</strong>
+                        <small>
+                          {searchState.ownedOnly ? "Showing only your imported collection" : "Showing the full Arena catalog"}
+                        </small>
+                      </span>
                     </label>
 
                     <div className="filter-group">

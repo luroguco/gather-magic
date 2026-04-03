@@ -79,6 +79,24 @@ describe("MTGA collection API", () => {
     expect(searchPayload.items[0].name).toBe("Angelic Blink");
   });
 
+  it("searches the synced Arena catalog even before a personal collection is imported", async () => {
+    const catalogResponse = await app.inject({
+      method: "GET",
+      url: "/api/cards/search?q=Angelic"
+    });
+    expect(catalogResponse.statusCode).toBe(200);
+    const catalogPayload = catalogResponse.json();
+    expect(catalogPayload.total).toBe(1);
+    expect(catalogPayload.items[0].name).toBe("Angelic Blink");
+
+    const ownedOnlyResponse = await app.inject({
+      method: "GET",
+      url: "/api/cards/search?q=Angelic&ownedOnly=true"
+    });
+    expect(ownedOnlyResponse.statusCode).toBe(200);
+    expect(ownedOnlyResponse.json().total).toBe(0);
+  });
+
   it("filters mechanics to owned cards when requested", async () => {
     importCollectionCsv(db, validCollectionCsv);
 
