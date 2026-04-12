@@ -8,7 +8,7 @@ import { sign } from "@electron/osx-sign";
 
 type PackageOptions = {
   arch: "arm64" | "x64" | "universal";
-  signApp: boolean;
+  signMode: "none" | "identity" | "adhoc";
 };
 
 const currentDir = dirname(fileURLToPath(import.meta.url));
@@ -26,7 +26,7 @@ const electronAppPath = resolve(electronPackageRoot, "dist/Electron.app");
 const parseArgs = (argv: string[]): PackageOptions => {
   const options: PackageOptions = {
     arch: process.arch === "arm64" || process.arch === "x64" ? process.arch : "arm64",
-    signApp: false
+    signMode: "none"
   };
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -34,7 +34,12 @@ const parseArgs = (argv: string[]): PackageOptions => {
     const nextArg = argv[index + 1];
 
     if (arg === "--sign") {
-      options.signApp = true;
+      options.signMode = "identity";
+      continue;
+    }
+
+    if (arg === "--adhoc-sign") {
+      options.signMode = "adhoc";
       continue;
     }
 
@@ -47,6 +52,25 @@ const parseArgs = (argv: string[]): PackageOptions => {
   }
 
   return options;
+};
+
+const shouldEnableHardenedRuntime = () => process.env.COLLECTOR_MAC_HARDENED_RUNTIME !== "0";
+
+const buildOptionsForFile = (
+  appPath: string,
+  signMode: PackageOptions["signMode"]
+) => (filePath: string) => ({
+  entitlements: filePath === appPath ? rootEntitlementsPath : inheritEntitlementsPath,
+  hardenedRuntime: shouldEnableHardenedRuntime(),
+  ...(signMode === "adhoc"
+    ? {
+        timestamp: "none"
+      }
+    : {})
+});
+
+const debugInfoPlistExtension = {
+  SecTaskAccess: ["allowed", "debug"]
 };
 
 const readPackageVersion = () => {
@@ -120,6 +144,8 @@ const main = async () => {
     asar: true,
     dir: packageRoot,
     executableName: productName,
+    extendHelperInfo: debugInfoPlistExtension,
+    extendInfo: debugInfoPlistExtension,
     name: productName,
     out: outputDirectory,
     overwrite: true,
@@ -148,21 +174,27 @@ const main = async () => {
 
   console.log(`Packaged app: ${appPath}`);
 
-  if (options.signApp) {
+  if (options.signMode !== "none") {
     const identity = process.env.COLLECTOR_MAC_IDENTITY;
     const provisioningProfile = process.env.COLLECTOR_MAC_PROVISIONING_PROFILE;
+    const usingAdHocSignature = options.signMode === "adhoc";
 
     await sign({
       app: appPath,
-      ...(identity ? { identity } : {}),
-      ...(provisioningProfile ? { provisioningProfile } : {}),
-      optionsForFile: (filePath) => ({
-        entitlements: filePath === appPath ? rootEntitlementsPath : inheritEntitlementsPath,
-        hardenedRuntime: process.env.COLLECTOR_MAC_HARDENED_RUNTIME !== "0"
-      })
+      ...(usingAdHocSignature
+        ? {
+            identity: "-",
+            identityValidation: false,
+            preAutoEntitlements: false,
+            preEmbedProvisioningProfile: false
+          }
+        : {}),
+      ...(!usingAdHocSignature && identity ? { identity } : {}),
+      ...(!usingAdHocSignature && provisioningProfile ? { provisioningProfile } : {}),
+      optionsForFile: buildOptionsForFile(appPath, options.signMode)
     });
 
-    console.log("Signing completed.");
+    console.log(usingAdHocSignature ? "Ad hoc signing completed." : "Signing completed.");
   }
 
   console.log("To run the packaged probe from this repo:");

@@ -32,6 +32,13 @@ npm run collector:package:mac
 Packages a macOS `.app` bundle under `apps/collector/out/mac/`.
 
 ```bash
+npm run collector:package:mac:adhoc
+```
+
+Packages and ad hoc signs the macOS app for local-only testing. This does not require an Apple
+signing identity or provisioning profile.
+
+```bash
 npm run collector:package:mac:signed
 ```
 
@@ -56,14 +63,19 @@ The current scaffold proves:
 - the host can run the shared `probeMtgaRuntime` module
 - probe reports are saved to `data/collector/latest-runtime-probe.json` and timestamped archives
 - the collector app can be packaged into a local macOS `.app` bundle without downloading Electron again
+- the ad hoc signed packaged app can enter the headless probe path on this machine
 
 The current scaffold does not yet prove:
 - that an unsigned Electron host can connect to MTGA runtime successfully
 - that we can extract `grpId -> quantity`
-- that the packaged `.app` enters the probe path correctly when invoked headlessly on this machine
+- that ad hoc local signing is enough to cross the MTGA runtime-access boundary
 
 Current machine constraint:
 - `security find-identity -v -p codesigning` returned `0 valid identities found`
-- a proper signed package test is blocked until a usable signing identity is installed
+- Apple-signed package testing is blocked until a usable signing identity is installed
+- local ad hoc package testing is still available with `npm run collector:package:mac:adhoc`
 
-The first real decision point is whether a packaged signed Electron app changes the `Scry.connect(...)` result. If not, the next path should be a signed native helper bundle rather than more work on the unsigned Electron shape.
+Current ad hoc result:
+- a packaged ad hoc signed run still ends with `Scry.connect(...)` failing against the live MTGA PID
+
+The first real decision point is whether an Apple-signed packaged Electron app changes the `Scry.connect(...)` result. If not, the next path should be a signed native helper bundle rather than more work on the Electron shape.

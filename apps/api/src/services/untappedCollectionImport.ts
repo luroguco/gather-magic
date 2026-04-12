@@ -2,8 +2,33 @@ import type { DbHandle } from "../lib/database.js";
 import { getOwnedCountView } from "../lib/cardCopies.js";
 
 export type UntappedCatalogSource = "database" | "untapped-public";
+export type CollectionImportSource = "untapped-json" | "collector-snapshot";
 
 type RawCollectionMap = Record<string, number>;
+type CollectorSnapshotPayload = {
+  snapshotVersion: number;
+  capturedAt?: string;
+  platform?: string;
+  collectorVersion?: string;
+  mtgaPid?: number;
+  diagnostics?: {
+    source?: string;
+    warnings?: string[];
+  };
+  collection: RawCollectionMap;
+};
+
+export type CollectorSnapshotMetadata = {
+  snapshotVersion: number;
+  capturedAt?: string;
+  platform?: string;
+  collectorVersion?: string;
+  mtgaPid?: number;
+  diagnostics?: {
+    source?: string;
+    warnings?: string[];
+  };
+};
 
 export type UntappedVariantEntry = {
   grpId: number;
@@ -24,6 +49,7 @@ export type NormalizedUntappedPayload = {
   generatedAt: string;
   extractedPath: string;
   catalogSource: UntappedCatalogSource;
+  snapshotMetadata?: CollectorSnapshotMetadata;
   catalogMetadata?: {
     build?: string | null;
     locale?: string;
@@ -38,11 +64,12 @@ export type NormalizedUntappedPayload = {
   cards: Record<string, NormalizedUntappedCardEntry>;
 };
 
-export type UntappedImportSummary = {
-  source: "untapped-json";
+export type CollectionImportSummary = {
+  source: CollectionImportSource;
   importedAt?: string;
   extractedPath: string;
   catalogSource: UntappedCatalogSource;
+  snapshotMetadata?: CollectorSnapshotMetadata;
   catalogMetadata?: {
     build?: string | null;
     locale?: string;
@@ -71,6 +98,8 @@ export type UntappedImportSummary = {
     unchangedTitles: number;
   };
 };
+
+export type UntappedImportSummary = CollectionImportSummary;
 
 type CardRules = {
   typeLine: string;
@@ -119,8 +148,11 @@ const untappedCatalogCache = new Map<string, Promise<CatalogLookup>>();
 
 const normalizeName = (value: string) => value.trim().toLowerCase().replace(/\s+/g, " ");
 
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  value != null && typeof value === "object" && !Array.isArray(value);
+
 const isNumericKeyedMap = (value: unknown): value is RawCollectionMap => {
-  if (value == null || typeof value !== "object" || Array.isArray(value)) {
+  if (!isRecord(value)) {
     return false;
   }
 
@@ -132,10 +164,46 @@ const isNumericKeyedMap = (value: unknown): value is RawCollectionMap => {
   return entries.every(([key, entryValue]) => /^\d+$/.test(key) && typeof entryValue === "number");
 };
 
-export const findUntappedCollectionMap = (
+const normalizeCollectorSnapshotMetadata = (value: CollectorSnapshotPayload): CollectorSnapshotMetadata => ({
+  snapshotVersion: value.snapshotVersion,
+  ...(typeof value.capturedAt === "string" ? { capturedAt: value.capturedAt } : {}),
+  ...(typeof value.platform === "string" ? { platform: value.platform } : {}),
+  ...(typeof value.collectorVersion === "string" ? { collectorVersion: value.collectorVersion } : {}),
+  ...(typeof value.mtgaPid === "number" ? { mtgaPid: value.mtgaPid } : {}),
+  ...(value.diagnostics
+    ? {
+        diagnostics: {
+          ...(typeof value.diagnostics.source === "string" ? { source: value.diagnostics.source } : {}),
+          ...(Array.isArray(value.diagnostics.warnings)
+            ? {
+                warnings: value.diagnostics.warnings.filter((warning): warning is string => typeof warning === "string")
+              }
+            : {})
+        }
+      }
+    : {})
+});
+
+const isCollectorSnapshotPayload = (value: unknown): value is CollectorSnapshotPayload => {
+  if (!isRecord(value)) {
+    return false;
+  }
+
+  return Number.isInteger(value.snapshotVersion) && isNumericKeyedMap(value.collection);
+};
+
+export const findCollectionOwnershipMap = (
   value: unknown,
   path = "root"
-): { map: RawCollectionMap; path: string } | null => {
+): { map: RawCollectionMap; path: string; snapshotMetadata?: CollectorSnapshotMetadata } | null => {
+  if (isCollectorSnapshotPayload(value)) {
+    return {
+      map: value.collection,
+      path: `${path}.collection`,
+      snapshotMetadata: normalizeCollectorSnapshotMetadata(value)
+    };
+  }
+
   if (isNumericKeyedMap(value)) {
     return { map: value, path };
   }
@@ -146,7 +214,7 @@ export const findUntappedCollectionMap = (
 
   if (Array.isArray(value)) {
     for (let index = 0; index < value.length; index += 1) {
-      const found = findUntappedCollectionMap(value[index], `${path}[${index}]`);
+      const found = findCollectionOwnershipMap(value[index], `${path}[${index}]`);
       if (found) {
         return found;
       }
@@ -155,7 +223,7 @@ export const findUntappedCollectionMap = (
   }
 
   for (const [key, nestedValue] of Object.entries(value)) {
-    const found = findUntappedCollectionMap(nestedValue, `${path}.${key}`);
+    const found = findCollectionOwnershipMap(nestedValue, `${path}.${key}`);
     if (found) {
       return found;
     }
@@ -163,6 +231,8 @@ export const findUntappedCollectionMap = (
 
   return null;
 };
+
+export const findUntappedCollectionMap = findCollectionOwnershipMap;
 
 const buildDatabaseCatalogLookup = (db: DbHandle): CatalogLookup => {
   const rows = db
@@ -336,7 +406,7 @@ export const normalizeUntappedCollectionPayload = async (
     untappedLocale?: string;
   }
 ): Promise<NormalizedUntappedPayload> => {
-  const found = findUntappedCollectionMap(rawPayload);
+  const found = findCollectionOwnershipMap(rawPayload);
   if (!found) {
     throw new Error("Could not find a numeric grpId -> quantity map in the input JSON.");
   }
@@ -406,6 +476,7 @@ export const normalizeUntappedCollectionPayload = async (
     generatedAt: new Date().toISOString(),
     extractedPath: found.path,
     catalogSource,
+    ...(found.snapshotMetadata ? { snapshotMetadata: found.snapshotMetadata } : {}),
     ...(catalog.metadata ? { catalogMetadata: catalog.metadata } : {}),
     rawEntryCount: Object.keys(found.map).length,
     matchedGrpIds,
@@ -629,6 +700,54 @@ const replaceCollectionSnapshot = (db: DbHandle, entries: Map<string, ResolvedCo
   transaction();
 };
 
+const buildCollectionImportSummary = (
+  source: CollectionImportSource,
+  normalizedPayload: NormalizedUntappedPayload,
+  entries: Map<string, ResolvedCollectionEntry>,
+  unresolvedCards: UntappedImportSummary["unresolvedCards"],
+  diff: UntappedImportSummary["diff"],
+  importedAt?: string
+): CollectionImportSummary => ({
+  source,
+  ...(importedAt ? { importedAt } : {}),
+  extractedPath: normalizedPayload.extractedPath,
+  catalogSource: normalizedPayload.catalogSource,
+  ...(normalizedPayload.snapshotMetadata ? { snapshotMetadata: normalizedPayload.snapshotMetadata } : {}),
+  ...(normalizedPayload.catalogMetadata ? { catalogMetadata: normalizedPayload.catalogMetadata } : {}),
+  rawEntryCount: normalizedPayload.rawEntryCount,
+  matchedGrpIds: normalizedPayload.matchedGrpIds,
+  unmatchedGrpIds: normalizedPayload.unmatchedGrpIds,
+  unmatchedEntries: normalizedPayload.unmatchedEntries,
+  cardsMatched: entries.size,
+  ownedTitles: entries.size,
+  ownedCopies: [...entries.values()].reduce((sum, entry) => sum + entry.count, 0),
+  rawOwnedCopies: [...entries.values()].reduce((sum, entry) => sum + entry.printCount, 0),
+  unresolvedCards,
+  diff
+});
+
+const prepareCollectionImport = async (
+  db: DbHandle,
+  rawJson: string,
+  options?: {
+    catalogSource?: UntappedCatalogSource;
+    untappedBuild?: string;
+    untappedLocale?: string;
+  }
+) => {
+  const rawPayload = JSON.parse(rawJson) as unknown;
+  const normalizedPayload = await normalizeUntappedCollectionPayload(db, rawPayload, options);
+  const { entries, unresolvedCards } = resolveNormalizedCardsToLocalCollection(db, normalizedPayload);
+  const diff = computeCollectionDiff(db, entries);
+
+  return {
+    normalizedPayload,
+    entries,
+    unresolvedCards,
+    diff
+  };
+};
+
 export const previewUntappedCollectionImport = async (
   db: DbHandle,
   rawJson: string,
@@ -638,27 +757,14 @@ export const previewUntappedCollectionImport = async (
     untappedLocale?: string;
   }
 ): Promise<UntappedImportSummary> => {
-  const rawPayload = JSON.parse(rawJson) as unknown;
-  const normalizedPayload = await normalizeUntappedCollectionPayload(db, rawPayload, options);
-  const { entries, unresolvedCards } = resolveNormalizedCardsToLocalCollection(db, normalizedPayload);
-  const diff = computeCollectionDiff(db, entries);
-
-  return {
-    source: "untapped-json",
-    extractedPath: normalizedPayload.extractedPath,
-    catalogSource: normalizedPayload.catalogSource,
-    ...(normalizedPayload.catalogMetadata ? { catalogMetadata: normalizedPayload.catalogMetadata } : {}),
-    rawEntryCount: normalizedPayload.rawEntryCount,
-    matchedGrpIds: normalizedPayload.matchedGrpIds,
-    unmatchedGrpIds: normalizedPayload.unmatchedGrpIds,
-    unmatchedEntries: normalizedPayload.unmatchedEntries,
-    cardsMatched: entries.size,
-    ownedTitles: entries.size,
-    ownedCopies: [...entries.values()].reduce((sum, entry) => sum + entry.count, 0),
-    rawOwnedCopies: [...entries.values()].reduce((sum, entry) => sum + entry.printCount, 0),
-    unresolvedCards,
-    diff
-  };
+  const prepared = await prepareCollectionImport(db, rawJson, options);
+  return buildCollectionImportSummary(
+    "untapped-json",
+    prepared.normalizedPayload,
+    prepared.entries,
+    prepared.unresolvedCards,
+    prepared.diff
+  );
 };
 
 export const importUntappedCollectionJson = async (
@@ -670,28 +776,58 @@ export const importUntappedCollectionJson = async (
     untappedLocale?: string;
   }
 ): Promise<UntappedImportSummary> => {
-  const rawPayload = JSON.parse(rawJson) as unknown;
-  const normalizedPayload = await normalizeUntappedCollectionPayload(db, rawPayload, options);
-  const { entries, unresolvedCards } = resolveNormalizedCardsToLocalCollection(db, normalizedPayload);
-  const diff = computeCollectionDiff(db, entries);
+  const prepared = await prepareCollectionImport(db, rawJson, options);
   const importedAt = new Date().toISOString();
-  replaceCollectionSnapshot(db, entries, importedAt);
+  replaceCollectionSnapshot(db, prepared.entries, importedAt);
 
-  return {
-    source: "untapped-json",
-    extractedPath: normalizedPayload.extractedPath,
-    catalogSource: normalizedPayload.catalogSource,
-    ...(normalizedPayload.catalogMetadata ? { catalogMetadata: normalizedPayload.catalogMetadata } : {}),
-    rawEntryCount: normalizedPayload.rawEntryCount,
-    matchedGrpIds: normalizedPayload.matchedGrpIds,
-    unmatchedGrpIds: normalizedPayload.unmatchedGrpIds,
-    unmatchedEntries: normalizedPayload.unmatchedEntries,
-    cardsMatched: entries.size,
-    ownedTitles: entries.size,
-    ownedCopies: [...entries.values()].reduce((sum, entry) => sum + entry.count, 0),
-    rawOwnedCopies: [...entries.values()].reduce((sum, entry) => sum + entry.printCount, 0),
-    unresolvedCards,
-    diff,
+  return buildCollectionImportSummary(
+    "untapped-json",
+    prepared.normalizedPayload,
+    prepared.entries,
+    prepared.unresolvedCards,
+    prepared.diff,
     importedAt
-  };
+  );
+};
+
+export const previewCollectorSnapshotImport = async (
+  db: DbHandle,
+  rawJson: string,
+  options?: {
+    catalogSource?: UntappedCatalogSource;
+    untappedBuild?: string;
+    untappedLocale?: string;
+  }
+): Promise<CollectionImportSummary> => {
+  const prepared = await prepareCollectionImport(db, rawJson, options);
+  return buildCollectionImportSummary(
+    "collector-snapshot",
+    prepared.normalizedPayload,
+    prepared.entries,
+    prepared.unresolvedCards,
+    prepared.diff
+  );
+};
+
+export const importCollectorSnapshotJson = async (
+  db: DbHandle,
+  rawJson: string,
+  options?: {
+    catalogSource?: UntappedCatalogSource;
+    untappedBuild?: string;
+    untappedLocale?: string;
+  }
+): Promise<CollectionImportSummary> => {
+  const prepared = await prepareCollectionImport(db, rawJson, options);
+  const importedAt = new Date().toISOString();
+  replaceCollectionSnapshot(db, prepared.entries, importedAt);
+
+  return buildCollectionImportSummary(
+    "collector-snapshot",
+    prepared.normalizedPayload,
+    prepared.entries,
+    prepared.unresolvedCards,
+    prepared.diff,
+    importedAt
+  );
 };

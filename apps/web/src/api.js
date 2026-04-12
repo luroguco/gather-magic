@@ -5,7 +5,19 @@ async function request(path, init) {
     const response = await fetch(path, init);
     if (!response.ok) {
         const text = await response.text();
-        throw new Error(text || `Request failed with ${response.status}`);
+        let parsedError = null;
+        if (text.trim().startsWith("{")) {
+            try {
+                const parsed = JSON.parse(text);
+                if (typeof parsed.error === "string" && parsed.error.trim().length > 0) {
+                    parsedError = parsed.error;
+                }
+            }
+            catch {
+                // Fall through to the raw text if the error payload is not valid JSON.
+            }
+        }
+        throw new Error(parsedError ?? (text || `Request failed with ${response.status}`));
     }
     return (await response.json());
 }
@@ -19,6 +31,7 @@ export const getMechanics = async (options) => {
     return (await request(`/api/mechanics${suffix}`)).items;
 };
 export const searchCards = (params) => request(`/api/cards/search?${params.toString()}`);
+export const getCardStats = (params) => request(`/api/stats/cards?${params.toString()}`);
 export const getCard = (id) => request(`/api/cards/${id}`);
 export const uploadCollection = async (file) => {
     const formData = new FormData();
@@ -44,6 +57,32 @@ export const importUntappedCollection = async (file) => {
         body: formData
     });
 };
+export const previewCollectorSnapshot = async (file) => {
+    const formData = new FormData();
+    formData.append("file", file);
+    return request("/api/imports/collector-snapshot/preview", {
+        method: "POST",
+        body: formData
+    });
+};
+export const importCollectorSnapshot = async (file) => {
+    const formData = new FormData();
+    formData.append("file", file);
+    return request("/api/imports/collector-snapshot", {
+        method: "POST",
+        body: formData
+    });
+};
+export const getCollectorHelperStatus = () => request("/api/imports/collector-helper/status");
+export const capturePreviewCollectorSnapshot = () => request("/api/imports/collector-helper/capture-preview", {
+    method: "POST"
+});
+export const previewLatestCollectorSnapshot = () => request("/api/imports/collector-helper/preview-latest", {
+    method: "POST"
+});
+export const importLatestCollectorSnapshot = () => request("/api/imports/collector-helper/import-latest", {
+    method: "POST"
+});
 export const getUntappedHelperStatus = () => request("/api/imports/untapped-helper/status");
 export const startUntappedHelper = () => request("/api/imports/untapped-helper/start", {
     method: "POST"

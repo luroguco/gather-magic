@@ -20,11 +20,57 @@ What is already proven in this repo:
 - Untapped is almost certainly reading live MTGA runtime state, not just logs.
 - once a raw `grpId -> quantity` map exists, normalization is effectively solved
 - the current Untapped-public catalog flow already gets collection parity close enough to trust
+- an ad hoc signed native helper can obtain a task port to live MTGA on this machine
+- an ad hoc signed copied Node host can call `Scry.connect(pid)` successfully
+- our own local collector code can now read `WrapperController.Instance.InventoryManager._inventoryServiceWrapper.Cards`
+- the live `Cards` dictionary yields the expected `grpId -> quantity` entries
+- the captured collector snapshot now matches the CSV baseline exactly after normalization
+  - `1,559` unique names
+  - `2,586` title-level owned total
+  - `2,615` print-level owned total
+  - `0` missing names
+  - `0` extra names
+  - `0` mismatched title counts
 
 What is not proven yet:
 
-- that our own host process can access MTGA runtime state safely and repeatably
-- that we can extract the collection map without depending on Untapped's private addon or an LLDB debugger path
+- that the current signed-host approach is stable enough to package as a polished end-user collector app
+- that the current capture path survives MTGA updates without more adaptation work
+
+### April 2026 Signed-Node Breakthrough
+
+The repo now includes a working local collector snapshot path:
+
+- `npm run collect:mtga:snapshot`
+
+What this command does:
+
+- copies the current local `node` binary into `apps/api/out/node-probe/mtga_probe_node`
+- ad hoc signs that copied host with:
+  - `com.apple.security.cs.debugger`
+  - `com.apple.security.get-task-allow`
+- re-executes the collector under that signed host
+- connects to live MTGA through `untapped-scry`
+- walks:
+  - `WrapperController.Instance`
+  - `InventoryManager`
+  - `_inventoryServiceWrapper`
+  - `Cards`
+- extracts the live dictionary entries into:
+  - `data/collector/latest-collector-snapshot.json`
+
+Current observed result:
+
+- raw dictionary entries scanned: `1,931`
+- filtered owned `grpId` entries: `1,750`
+- the only obvious junk slot observed in the current map was `0 -> 0`
+- the emitted snapshot envelope is already accepted by the repo's collector import path
+- normalization and comparison against the baseline now produce an exact match
+
+Interpretation:
+
+- the hard extraction problem is no longer blocked
+- the remaining work is productization, not proof of access
 
 ### April 2026 Phase 0 Spike Result
 
@@ -36,11 +82,15 @@ Observed result from the current headless probe run:
 - the shared runtime probe runs and finds the live MTGA PID
 - `Scry.connect(...)` still fails from this unsigned/dev host shape
 - an unsigned packaged macOS `.app` bundle now builds successfully from the repo
+- an ad hoc signed packaged macOS `.app` bundle can run the headless probe locally
+- `Scry.connect(...)` still fails from that ad hoc signed packaged host shape
 - this machine currently has no valid code-signing identities, so the signed packaged-host experiment is still blocked
+- the repo now supports an ad hoc signed packaged-host experiment for local-only testing without an Apple certificate
 
 Interpretation:
 
 - moving from plain Node to an unsigned Electron host was not enough by itself
+- ad hoc local signing was enough to validate the packaged-host probe path, but it was not enough to cross the MTGA runtime-access boundary
 - the next meaningful experiment is still a packaged signed Electron build
 - if that still fails, stop pushing Electron-first and move to a signed native helper bundle
 

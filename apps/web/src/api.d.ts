@@ -1,9 +1,10 @@
-import type { AppStatus, CardDetail, Deck, DeckCard, DeckListItem, Mechanic, UntappedCaptureImportSummary, UntappedCaptureStartResult, UntappedCaptureStatus, UntappedCaptureStopResult, SearchResponse, UntappedImportSummary, ValidationResult } from "./types";
+import type { AppStatus, CardStatsResponse, CardDetail, CollectionImportSummary, CollectorCaptureImportSummary, CollectorCaptureStatus, Deck, DeckCard, DeckListItem, Mechanic, UntappedCaptureImportSummary, UntappedCaptureStartResult, UntappedCaptureStatus, UntappedCaptureStopResult, SearchResponse, ValidationResult } from "./types";
 export declare const getStatus: () => Promise<AppStatus>;
 export declare const getMechanics: (options?: {
     ownedOnly?: boolean;
 }) => Promise<Mechanic[]>;
 export declare const searchCards: (params: URLSearchParams) => Promise<SearchResponse>;
+export declare const getCardStats: (params: URLSearchParams) => Promise<CardStatsResponse>;
 export declare const getCard: (id: string) => Promise<CardDetail>;
 export declare const uploadCollection: (file: File) => Promise<{
     importedAt: string;
@@ -12,8 +13,14 @@ export declare const uploadCollection: (file: File) => Promise<{
     ownedCopies: number;
     unresolvedRows: Array<Record<string, string>>;
 }>;
-export declare const previewUntappedCollection: (file: File) => Promise<UntappedImportSummary>;
-export declare const importUntappedCollection: (file: File) => Promise<UntappedImportSummary>;
+export declare const previewUntappedCollection: (file: File) => Promise<CollectionImportSummary>;
+export declare const importUntappedCollection: (file: File) => Promise<CollectionImportSummary>;
+export declare const previewCollectorSnapshot: (file: File) => Promise<CollectionImportSummary>;
+export declare const importCollectorSnapshot: (file: File) => Promise<CollectionImportSummary>;
+export declare const getCollectorHelperStatus: () => Promise<CollectorCaptureStatus>;
+export declare const capturePreviewCollectorSnapshot: () => Promise<CollectorCaptureImportSummary>;
+export declare const previewLatestCollectorSnapshot: () => Promise<CollectorCaptureImportSummary>;
+export declare const importLatestCollectorSnapshot: () => Promise<CollectorCaptureImportSummary>;
 export declare const getUntappedHelperStatus: () => Promise<UntappedCaptureStatus>;
 export declare const startUntappedHelper: () => Promise<UntappedCaptureStartResult>;
 export declare const stopUntappedHelper: () => Promise<UntappedCaptureStopResult>;

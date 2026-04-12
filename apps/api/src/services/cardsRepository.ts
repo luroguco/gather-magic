@@ -14,58 +14,153 @@ export type SearchFilters = {
   rarity?: string[] | undefined;
   sets?: string[] | undefined;
   ownedOnly?: boolean | undefined;
+  playableCountMin?: number | undefined;
+  playableCountMax?: number | undefined;
   manaValueMin?: number | undefined;
   manaValueMax?: number | undefined;
+  drilldownKind?: CardDrilldownKind | undefined;
+  drilldownKey?: string | undefined;
   page: number;
   pageSize: number;
 };
 
-const parseJsonArray = (value: string | null) => (value ? (JSON.parse(value) as string[]) : []);
-const parseJsonObject = (value: string | null) =>
-  value ? (JSON.parse(value) as Record<string, string>) : {};
+export const CARD_DRILLDOWN_KINDS = ["color", "manaValue", "type", "rarity", "set", "mechanic"] as const;
+export type CardDrilldownKind = (typeof CARD_DRILLDOWN_KINDS)[number];
 
-const mapCardRow = (row: Record<string, unknown>): CardSummary => {
-  const oracleText = String(row.oracle_text ?? "");
-  const typeLine = String(row.type_line ?? "");
-  const rawOwnedCount = Number(row.owned_count ?? 0);
-  const mechanics = (JSON.parse(String(row.mechanics_json ?? "[]")) as Array<{
-    slug: string;
-    label: string;
-    type: "keyword" | "derived";
-  }>).map((mechanic) => ({
-    ...mechanic,
-    definition: getMechanicDefinition(mechanic.slug, mechanic.label, mechanic.type)
-  }));
-  const ownedCountView = getOwnedCountView(rawOwnedCount, oracleText, typeLine);
+export type StatsBreakdownItem = {
+  key: string;
+  label: string;
+  titleCount: number;
+  playableOwnedCopies: number;
+  rawOwnedCopies: number;
+};
 
-  return {
-    id: String(row.id),
-    name: String(row.name),
-    oracleText,
-    manaCost: row.mana_cost ? String(row.mana_cost) : null,
-    manaValue: Number(row.mana_value ?? 0),
-    colors: parseJsonArray((row.colors_json as string | null) ?? null),
-    colorIdentity: parseJsonArray((row.color_identity_json as string | null) ?? null),
-    typeLine,
-    rarity: String(row.rarity ?? ""),
-    preferredSetCode: row.preferred_set_code ? String(row.preferred_set_code) : null,
-    preferredCollectorNumber: row.preferred_collector_number ? String(row.preferred_collector_number) : null,
-    imageUrl: row.image_url ? String(row.image_url) : null,
-    keywords: parseJsonArray((row.keywords_json as string | null) ?? null),
-    legalities: parseJsonObject((row.legalities_json as string | null) ?? null),
-    ownedCount: ownedCountView.playableOwnedCount,
-    rawOwnedCount: ownedCountView.rawOwnedCount,
-    deckBuildingLimit: ownedCountView.deckBuildingLimit,
-    mechanics
+export type CardStatsResponse = {
+  scope: {
+    ownedOnly: boolean;
+    filtersApplied: {
+      q?: string;
+      format?: ArenaFormat;
+      colors: string[];
+      mechanics: string[];
+      types: string[];
+      subtypes: string[];
+      rarity: string[];
+      sets: string[];
+      playableCountMin?: number;
+      playableCountMax?: number;
+      manaValueMin?: number;
+      manaValueMax?: number;
+    };
+  };
+  summary: {
+    matchingTitles: number;
+    playableOwnedCopies: number;
+    rawOwnedCopies: number;
+    averageManaValue: number;
+    colorBucketsRepresented: number;
+    setsRepresented: number;
+    mechanicsRepresented: number;
+  };
+  breakdowns: {
+    colors: StatsBreakdownItem[];
+    manaValues: StatsBreakdownItem[];
+    types: StatsBreakdownItem[];
+    rarities: StatsBreakdownItem[];
+    sets: StatsBreakdownItem[];
+    mechanics: StatsBreakdownItem[];
   };
 };
 
-export const searchCards = (db: DbHandle, filters: SearchFilters) => {
+const playableOwnedCountSql = `
+  CASE
+    WHEN lower(cards.type_line) LIKE '%basic land%' THEN coalesce(collection_cards.count, 0)
+    WHEN lower(cards.oracle_text) LIKE '%a deck can have any number of cards named%' THEN coalesce(collection_cards.count, 0)
+    WHEN lower(cards.oracle_text) GLOB '*a deck can have up to [0-9]* cards named*' THEN
+      MIN(
+        coalesce(collection_cards.count, 0),
+        CAST(substr(lower(cards.oracle_text), instr(lower(cards.oracle_text), 'a deck can have up to ') + 23) AS INTEGER)
+      )
+    WHEN lower(cards.oracle_text) LIKE '%a deck can have up to one cards named%' THEN MIN(coalesce(collection_cards.count, 0), 1)
+    WHEN lower(cards.oracle_text) LIKE '%a deck can have up to two cards named%' THEN MIN(coalesce(collection_cards.count, 0), 2)
+    WHEN lower(cards.oracle_text) LIKE '%a deck can have up to three cards named%' THEN MIN(coalesce(collection_cards.count, 0), 3)
+    WHEN lower(cards.oracle_text) LIKE '%a deck can have up to four cards named%' THEN MIN(coalesce(collection_cards.count, 0), 4)
+    WHEN lower(cards.oracle_text) LIKE '%a deck can have up to five cards named%' THEN MIN(coalesce(collection_cards.count, 0), 5)
+    WHEN lower(cards.oracle_text) LIKE '%a deck can have up to six cards named%' THEN MIN(coalesce(collection_cards.count, 0), 6)
+    WHEN lower(cards.oracle_text) LIKE '%a deck can have up to seven cards named%' THEN MIN(coalesce(collection_cards.count, 0), 7)
+    WHEN lower(cards.oracle_text) LIKE '%a deck can have up to eight cards named%' THEN MIN(coalesce(collection_cards.count, 0), 8)
+    WHEN lower(cards.oracle_text) LIKE '%a deck can have up to nine cards named%' THEN MIN(coalesce(collection_cards.count, 0), 9)
+    WHEN lower(cards.oracle_text) LIKE '%a deck can have up to ten cards named%' THEN MIN(coalesce(collection_cards.count, 0), 10)
+    WHEN lower(cards.oracle_text) LIKE '%a deck can have up to eleven cards named%' THEN MIN(coalesce(collection_cards.count, 0), 11)
+    WHEN lower(cards.oracle_text) LIKE '%a deck can have up to twelve cards named%' THEN MIN(coalesce(collection_cards.count, 0), 12)
+    ELSE MIN(coalesce(collection_cards.count, 0), 4)
+  END
+`;
+
+const colorBucketSql = `
+  CASE
+    WHEN cards.color_identity_json = '[]' THEN 'colorless'
+    WHEN cards.color_identity_json = '["W"]' THEN 'mono-white'
+    WHEN cards.color_identity_json = '["U"]' THEN 'mono-blue'
+    WHEN cards.color_identity_json = '["B"]' THEN 'mono-black'
+    WHEN cards.color_identity_json = '["R"]' THEN 'mono-red'
+    WHEN cards.color_identity_json = '["G"]' THEN 'mono-green'
+    ELSE 'multicolor'
+  END
+`;
+
+const manaValueBucketSql = `
+  CASE
+    WHEN cards.mana_value >= 6 THEN '6+'
+    WHEN cards.mana_value >= 5 THEN '5'
+    WHEN cards.mana_value >= 4 THEN '4'
+    WHEN cards.mana_value >= 3 THEN '3'
+    WHEN cards.mana_value >= 2 THEN '2'
+    WHEN cards.mana_value >= 1 THEN '1'
+    ELSE '0'
+  END
+`;
+
+const typeBucketSql = `
+  CASE
+    WHEN lower(cards.type_line) LIKE '%creature%' THEN 'creature'
+    WHEN lower(cards.type_line) LIKE '%instant%' THEN 'instant'
+    WHEN lower(cards.type_line) LIKE '%sorcery%' THEN 'sorcery'
+    WHEN lower(cards.type_line) LIKE '%artifact%' THEN 'artifact'
+    WHEN lower(cards.type_line) LIKE '%enchantment%' THEN 'enchantment'
+    WHEN lower(cards.type_line) LIKE '%planeswalker%' THEN 'planeswalker'
+    WHEN lower(cards.type_line) LIKE '%land%' THEN 'land'
+    ELSE 'other'
+  END
+`;
+
+const setBucketSql = `
+  CASE
+    WHEN cards.preferred_set_code IS NULL OR trim(cards.preferred_set_code) = '' THEN 'Unknown'
+    ELSE upper(cards.preferred_set_code)
+  END
+`;
+
+const normalizeFilterList = (values?: string[]) => values?.filter(Boolean) ?? [];
+
+const normalizeFiltersForStats = (filters: SearchFilters) => ({
+  ...(filters.q?.trim() ? { q: filters.q.trim() } : {}),
+  ...(filters.format ? { format: filters.format } : {}),
+  colors: normalizeFilterList(filters.colors),
+  mechanics: normalizeFilterList(filters.mechanics),
+  types: normalizeFilterList(filters.types),
+  subtypes: normalizeFilterList(filters.subtypes),
+  rarity: normalizeFilterList(filters.rarity),
+  sets: normalizeFilterList(filters.sets),
+  ...(typeof filters.playableCountMin === "number" ? { playableCountMin: filters.playableCountMin } : {}),
+  ...(typeof filters.playableCountMax === "number" ? { playableCountMax: filters.playableCountMax } : {}),
+  ...(typeof filters.manaValueMin === "number" ? { manaValueMin: filters.manaValueMin } : {}),
+  ...(typeof filters.manaValueMax === "number" ? { manaValueMax: filters.manaValueMax } : {})
+});
+
+const buildCardFilterQuery = (filters: SearchFilters) => {
   const conditions: string[] = [];
-  const params: Record<string, unknown> = {
-    limit: filters.pageSize,
-    offset: (filters.page - 1) * filters.pageSize
-  };
+  const params: Record<string, unknown> = {};
 
   if (filters.q) {
     conditions.push("(cards.normalized_name LIKE @query OR lower(cards.oracle_text) LIKE @query)");
@@ -120,6 +215,48 @@ export const searchCards = (db: DbHandle, filters: SearchFilters) => {
     conditions.push("coalesce(collection_cards.count, 0) > 0");
   }
 
+  if (filters.drilldownKind && filters.drilldownKey) {
+    params.drilldownKey = filters.drilldownKey;
+
+    switch (filters.drilldownKind) {
+      case "color":
+        conditions.push(`${colorBucketSql} = @drilldownKey`);
+        break;
+      case "manaValue":
+        conditions.push(`${manaValueBucketSql} = @drilldownKey`);
+        break;
+      case "type":
+        conditions.push(`${typeBucketSql} = @drilldownKey`);
+        break;
+      case "rarity":
+        conditions.push("lower(cards.rarity) = @drilldownKey");
+        break;
+      case "set":
+        conditions.push(`${setBucketSql} = @drilldownKey`);
+        break;
+      case "mechanic":
+        conditions.push(`
+          EXISTS (
+            SELECT 1
+            FROM card_mechanics mechanic_drilldown
+            WHERE mechanic_drilldown.card_id = cards.id
+              AND mechanic_drilldown.tag_slug = @drilldownKey
+          )
+        `);
+        break;
+    }
+  }
+
+  if (typeof filters.playableCountMin === "number") {
+    conditions.push(`${playableOwnedCountSql} >= @playableCountMin`);
+    params.playableCountMin = filters.playableCountMin;
+  }
+
+  if (typeof filters.playableCountMax === "number") {
+    conditions.push(`${playableOwnedCountSql} <= @playableCountMax`);
+    params.playableCountMax = filters.playableCountMax;
+  }
+
   if (typeof filters.manaValueMin === "number") {
     conditions.push("cards.mana_value >= @manaValueMin");
     params.manaValueMin = filters.manaValueMin;
@@ -145,7 +282,97 @@ export const searchCards = (db: DbHandle, filters: SearchFilters) => {
     `);
   }
 
-  const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+  return {
+    where: conditions.length ? `WHERE ${conditions.join(" AND ")}` : "",
+    params
+  };
+};
+
+const filteredCardsCteSql = (where: string) => `
+  WITH filtered_cards AS (
+    SELECT
+      cards.id,
+      cards.name,
+      cards.oracle_text,
+      cards.type_line,
+      cards.mana_value,
+      cards.colors_json,
+      cards.color_identity_json,
+      cards.rarity,
+      cards.preferred_set_code,
+      coalesce(collection_cards.count, 0) AS raw_owned_count,
+      ${playableOwnedCountSql} AS playable_owned_count,
+      ${colorBucketSql} AS color_bucket,
+      ${manaValueBucketSql} AS mana_value_bucket,
+      ${typeBucketSql} AS type_bucket,
+      ${setBucketSql} AS set_bucket
+    FROM cards
+    LEFT JOIN collection_cards ON collection_cards.card_id = cards.id
+    ${where}
+  )
+`;
+
+const buildBreakdown = (
+  rows: Array<Record<string, unknown>>,
+  keyField: string,
+  labelField = "label"
+): StatsBreakdownItem[] =>
+  rows.map((row) => ({
+    key: String(row[keyField]),
+    label: String(row[labelField]),
+    titleCount: Number(row.titleCount ?? 0),
+    playableOwnedCopies: Number(row.playableOwnedCopies ?? 0),
+    rawOwnedCopies: Number(row.rawOwnedCopies ?? 0)
+  }));
+
+const parseJsonArray = (value: string | null) => (value ? (JSON.parse(value) as string[]) : []);
+const parseJsonObject = (value: string | null) =>
+  value ? (JSON.parse(value) as Record<string, string>) : {};
+
+const mapCardRow = (row: Record<string, unknown>): CardSummary => {
+  const oracleText = String(row.oracle_text ?? "");
+  const typeLine = String(row.type_line ?? "");
+  const rawOwnedCount = Number(row.owned_count ?? 0);
+  const mechanics = (JSON.parse(String(row.mechanics_json ?? "[]")) as Array<{
+    slug: string;
+    label: string;
+    type: "keyword" | "derived";
+  }>).map((mechanic) => ({
+    ...mechanic,
+    definition: getMechanicDefinition(mechanic.slug, mechanic.label, mechanic.type)
+  }));
+  const ownedCountView = getOwnedCountView(rawOwnedCount, oracleText, typeLine);
+
+  return {
+    id: String(row.id),
+    name: String(row.name),
+    oracleText,
+    manaCost: row.mana_cost ? String(row.mana_cost) : null,
+    manaValue: Number(row.mana_value ?? 0),
+    colors: parseJsonArray((row.colors_json as string | null) ?? null),
+    colorIdentity: parseJsonArray((row.color_identity_json as string | null) ?? null),
+    typeLine,
+    rarity: String(row.rarity ?? ""),
+    preferredSetCode: row.preferred_set_code ? String(row.preferred_set_code) : null,
+    preferredCollectorNumber: row.preferred_collector_number ? String(row.preferred_collector_number) : null,
+    imageUrl: row.image_url ? String(row.image_url) : null,
+    keywords: parseJsonArray((row.keywords_json as string | null) ?? null),
+    legalities: parseJsonObject((row.legalities_json as string | null) ?? null),
+    ownedCount: ownedCountView.playableOwnedCount,
+    rawOwnedCount: ownedCountView.rawOwnedCount,
+    deckBuildingLimit: ownedCountView.deckBuildingLimit,
+    mechanics
+  };
+};
+
+export const searchCards = (db: DbHandle, filters: SearchFilters) => {
+  const params: Record<string, unknown> = {
+    limit: filters.pageSize,
+    offset: (filters.page - 1) * filters.pageSize
+  };
+  const built = buildCardFilterQuery(filters);
+  Object.assign(params, built.params);
+  const where = built.where;
 
   const totalRow = db
     .prepare(
@@ -164,6 +391,7 @@ export const searchCards = (db: DbHandle, filters: SearchFilters) => {
       SELECT
         cards.*,
         coalesce(collection_cards.count, 0) AS owned_count,
+        ${playableOwnedCountSql} AS playable_owned_count,
         (
           SELECT json_group_array(
             json_object(
@@ -178,7 +406,7 @@ export const searchCards = (db: DbHandle, filters: SearchFilters) => {
       FROM cards
       LEFT JOIN collection_cards ON collection_cards.card_id = cards.id
       ${where}
-      ORDER BY coalesce(collection_cards.count, 0) DESC, cards.name ASC
+      ORDER BY ${playableOwnedCountSql} DESC, cards.name ASC
       LIMIT @limit OFFSET @offset
     `
     )
@@ -189,6 +417,224 @@ export const searchCards = (db: DbHandle, filters: SearchFilters) => {
     page: filters.page,
     pageSize: filters.pageSize,
     items: rows.map(mapCardRow)
+  };
+};
+
+export const getCardStats = (db: DbHandle, filters: SearchFilters): CardStatsResponse => {
+  const built = buildCardFilterQuery(filters);
+  const { where, params } = built;
+  const cte = filteredCardsCteSql(where);
+
+  const summaryRow = db
+    .prepare(
+      `
+      ${cte}
+      SELECT
+        COUNT(*) AS matchingTitles,
+        COALESCE(SUM(filtered_cards.playable_owned_count), 0) AS playableOwnedCopies,
+        COALESCE(SUM(filtered_cards.raw_owned_count), 0) AS rawOwnedCopies,
+        COALESCE(AVG(filtered_cards.mana_value), 0) AS averageManaValue,
+        COUNT(DISTINCT filtered_cards.color_bucket) AS colorBucketsRepresented,
+        COUNT(DISTINCT filtered_cards.set_bucket) AS setsRepresented
+      FROM filtered_cards
+    `
+    )
+    .get(params) as Record<string, unknown>;
+
+  const colorRows = db
+    .prepare(
+      `
+      ${cte}
+      SELECT
+        filtered_cards.color_bucket AS key,
+        CASE filtered_cards.color_bucket
+          WHEN 'colorless' THEN 'Colorless'
+          WHEN 'mono-white' THEN 'Mono-White'
+          WHEN 'mono-blue' THEN 'Mono-Blue'
+          WHEN 'mono-black' THEN 'Mono-Black'
+          WHEN 'mono-red' THEN 'Mono-Red'
+          WHEN 'mono-green' THEN 'Mono-Green'
+          ELSE 'Multicolor'
+        END AS label,
+        COUNT(*) AS titleCount,
+        COALESCE(SUM(filtered_cards.playable_owned_count), 0) AS playableOwnedCopies,
+        COALESCE(SUM(filtered_cards.raw_owned_count), 0) AS rawOwnedCopies
+      FROM filtered_cards
+      GROUP BY filtered_cards.color_bucket
+      ORDER BY CASE filtered_cards.color_bucket
+        WHEN 'colorless' THEN 0
+        WHEN 'mono-white' THEN 1
+        WHEN 'mono-blue' THEN 2
+        WHEN 'mono-black' THEN 3
+        WHEN 'mono-red' THEN 4
+        WHEN 'mono-green' THEN 5
+        ELSE 6
+      END
+    `
+    )
+    .all(params) as Array<Record<string, unknown>>;
+
+  const manaValueRows = db
+    .prepare(
+      `
+      ${cte}
+      SELECT
+        filtered_cards.mana_value_bucket AS key,
+        filtered_cards.mana_value_bucket AS label,
+        COUNT(*) AS titleCount,
+        COALESCE(SUM(filtered_cards.playable_owned_count), 0) AS playableOwnedCopies,
+        COALESCE(SUM(filtered_cards.raw_owned_count), 0) AS rawOwnedCopies
+      FROM filtered_cards
+      GROUP BY filtered_cards.mana_value_bucket
+      ORDER BY CASE filtered_cards.mana_value_bucket
+        WHEN '0' THEN 0
+        WHEN '1' THEN 1
+        WHEN '2' THEN 2
+        WHEN '3' THEN 3
+        WHEN '4' THEN 4
+        WHEN '5' THEN 5
+        ELSE 6
+      END
+    `
+    )
+    .all(params) as Array<Record<string, unknown>>;
+
+  const typeRows = db
+    .prepare(
+      `
+      ${cte}
+      SELECT
+        filtered_cards.type_bucket AS key,
+        CASE filtered_cards.type_bucket
+          WHEN 'creature' THEN 'Creature'
+          WHEN 'instant' THEN 'Instant'
+          WHEN 'sorcery' THEN 'Sorcery'
+          WHEN 'artifact' THEN 'Artifact'
+          WHEN 'enchantment' THEN 'Enchantment'
+          WHEN 'planeswalker' THEN 'Planeswalker'
+          WHEN 'land' THEN 'Land'
+          ELSE 'Other'
+        END AS label,
+        COUNT(*) AS titleCount,
+        COALESCE(SUM(filtered_cards.playable_owned_count), 0) AS playableOwnedCopies,
+        COALESCE(SUM(filtered_cards.raw_owned_count), 0) AS rawOwnedCopies
+      FROM filtered_cards
+      GROUP BY filtered_cards.type_bucket
+      ORDER BY CASE filtered_cards.type_bucket
+        WHEN 'creature' THEN 0
+        WHEN 'instant' THEN 1
+        WHEN 'sorcery' THEN 2
+        WHEN 'artifact' THEN 3
+        WHEN 'enchantment' THEN 4
+        WHEN 'planeswalker' THEN 5
+        WHEN 'land' THEN 6
+        ELSE 7
+      END
+    `
+    )
+    .all(params) as Array<Record<string, unknown>>;
+
+  const rarityRows = db
+    .prepare(
+      `
+      ${cte}
+      SELECT
+        lower(filtered_cards.rarity) AS key,
+        CASE lower(filtered_cards.rarity)
+          WHEN 'common' THEN 'Common'
+          WHEN 'uncommon' THEN 'Uncommon'
+          WHEN 'rare' THEN 'Rare'
+          WHEN 'mythic' THEN 'Mythic'
+          ELSE CASE
+            WHEN trim(filtered_cards.rarity) = '' THEN 'Unknown'
+            ELSE filtered_cards.rarity
+          END
+        END AS label,
+        COUNT(*) AS titleCount,
+        COALESCE(SUM(filtered_cards.playable_owned_count), 0) AS playableOwnedCopies,
+        COALESCE(SUM(filtered_cards.raw_owned_count), 0) AS rawOwnedCopies
+      FROM filtered_cards
+      GROUP BY lower(filtered_cards.rarity), label
+      ORDER BY CASE lower(filtered_cards.rarity)
+        WHEN 'common' THEN 0
+        WHEN 'uncommon' THEN 1
+        WHEN 'rare' THEN 2
+        WHEN 'mythic' THEN 3
+        ELSE 4
+      END, label
+    `
+    )
+    .all(params) as Array<Record<string, unknown>>;
+
+  const setRows = db
+    .prepare(
+      `
+      ${cte}
+      SELECT
+        filtered_cards.set_bucket AS key,
+        filtered_cards.set_bucket AS label,
+        COUNT(*) AS titleCount,
+        COALESCE(SUM(filtered_cards.playable_owned_count), 0) AS playableOwnedCopies,
+        COALESCE(SUM(filtered_cards.raw_owned_count), 0) AS rawOwnedCopies
+      FROM filtered_cards
+      GROUP BY filtered_cards.set_bucket
+      ORDER BY playableOwnedCopies DESC, titleCount DESC, label ASC
+    `
+    )
+    .all(params) as Array<Record<string, unknown>>;
+
+  const mechanicRows = db
+    .prepare(
+      `
+      ${cte}
+      SELECT
+        card_mechanics.tag_slug AS key,
+        card_mechanics.tag_label AS label,
+        COUNT(DISTINCT filtered_cards.id) AS titleCount,
+        COALESCE(SUM(filtered_cards.playable_owned_count), 0) AS playableOwnedCopies,
+        COALESCE(SUM(filtered_cards.raw_owned_count), 0) AS rawOwnedCopies
+      FROM filtered_cards
+      INNER JOIN card_mechanics ON card_mechanics.card_id = filtered_cards.id
+      GROUP BY card_mechanics.tag_slug, card_mechanics.tag_label
+      ORDER BY playableOwnedCopies DESC, titleCount DESC, label ASC
+      LIMIT 30
+    `
+    )
+    .all(params) as Array<Record<string, unknown>>;
+
+  const mechanicsRepresentedRow = db
+    .prepare(
+      `
+      ${cte}
+      SELECT COUNT(DISTINCT card_mechanics.tag_slug) AS mechanicsRepresented
+      FROM filtered_cards
+      INNER JOIN card_mechanics ON card_mechanics.card_id = filtered_cards.id
+    `
+    )
+    .get(params) as Record<string, unknown>;
+
+  return {
+    scope: {
+      ownedOnly: Boolean(filters.ownedOnly),
+      filtersApplied: normalizeFiltersForStats(filters)
+    },
+    summary: {
+      matchingTitles: Number(summaryRow.matchingTitles ?? 0),
+      playableOwnedCopies: Number(summaryRow.playableOwnedCopies ?? 0),
+      rawOwnedCopies: Number(summaryRow.rawOwnedCopies ?? 0),
+      averageManaValue: Number(Number(summaryRow.averageManaValue ?? 0).toFixed(2)),
+      colorBucketsRepresented: Number(summaryRow.colorBucketsRepresented ?? 0),
+      setsRepresented: Number(summaryRow.setsRepresented ?? 0),
+      mechanicsRepresented: Number(mechanicsRepresentedRow.mechanicsRepresented ?? 0)
+    },
+    breakdowns: {
+      colors: buildBreakdown(colorRows, "key"),
+      manaValues: buildBreakdown(manaValueRows, "key"),
+      types: buildBreakdown(typeRows, "key"),
+      rarities: buildBreakdown(rarityRows, "key"),
+      sets: buildBreakdown(setRows, "key"),
+      mechanics: buildBreakdown(mechanicRows, "key")
+    }
   };
 };
 

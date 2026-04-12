@@ -9,6 +9,7 @@
     "dev": "npm run build && npm run start",
     "lint": "tsc -p tsconfig.json --noEmit",
     "package:mac": "npm run build && node dist/packageMac.js",
+    "package:mac:adhoc": "npm run build && node dist/packageMac.js --adhoc-sign",
     "package:mac:signed": "npm run build && node dist/packageMac.js --sign",
     "probe:packaged": "node dist/runPackagedProbe.js",
     "probe:runtime": "npm run build && env -u ELECTRON_RUN_AS_NODE electron dist/main.js --run-runtime-probe",

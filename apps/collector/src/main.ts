@@ -1,7 +1,7 @@
 import { appendFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 type ProbeOverrides = {
   pid?: number;
@@ -36,13 +36,11 @@ type ProbeRunResult = {
 const require = createRequire(import.meta.url);
 const electron = require("electron") as typeof import("electron");
 const { app, BrowserWindow, ipcMain } = electron;
-type BrowserWindowInstance = InstanceType<typeof electron.BrowserWindow>;
 
 const currentDir = dirname(fileURLToPath(import.meta.url));
 const packageRoot = resolve(currentDir, "..");
 const defaultWorkspaceRoot = resolve(packageRoot, "../..");
 const uiPreloadPath = resolve(packageRoot, "dist/uiPreload.cjs");
-const probePreloadPath = resolve(packageRoot, "dist/probePreload.cjs");
 const indexPath = resolve(packageRoot, "dist/index.html");
 
 const resolveWorkspaceRoot = () => {
@@ -175,23 +173,6 @@ const createMainWindow = () => {
   return window;
 };
 
-const createProbeWindow = () =>
-  new BrowserWindow({
-    show: false,
-    webPreferences: {
-      preload: probePreloadPath,
-      sandbox: false,
-      contextIsolation: true,
-      nodeIntegration: false
-    }
-  });
-
-const getWebContentsEventTarget = (window: BrowserWindowInstance) =>
-  window.webContents as unknown as {
-    once: (event: string, listener: (...args: any[]) => void) => void;
-    removeListener: (event: string, listener: (...args: any[]) => void) => void;
-  };
-
 const runRuntimeProbe = async (overrides: ProbeOverrides = {}): Promise<ProbeRunResult> => {
   if (!existsSync(probeModulePath)) {
     throw new Error(
@@ -199,75 +180,14 @@ const runRuntimeProbe = async (overrides: ProbeOverrides = {}): Promise<ProbeRun
     );
   }
 
-  const probeWindow = createProbeWindow();
-  const webContentsEvents = getWebContentsEventTarget(probeWindow);
+  const probeModule = await import(pathToFileURL(probeModulePath).href);
+  const options =
+    typeof probeModule.parseArgs === "function"
+      ? probeModule.parseArgs([])
+      : { processPatterns: [], metadataTargets: [], monoImages: [] };
 
-  const report = await new Promise<ProbeReport>((resolvePromise, rejectPromise) => {
-    let settled = false;
-
-    const cleanup = () => {
-      ipcMain.removeListener("probe-ready", onReady);
-      ipcMain.removeListener("probe-result", onResult);
-      probeWindow.removeListener("closed", onClosed);
-      webContentsEvents.removeListener("did-fail-load", onDidFailLoad);
-      if (!probeWindow.isDestroyed()) {
-        probeWindow.destroy();
-      }
-    };
-
-    const finishWithError = (message: string) => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      cleanup();
-      rejectPromise(new Error(message));
-    };
-
-    const onReady = () => {
-      probeWindow.webContents.send("run-probe", {
-        modulePath: probeModulePath,
-        overrides
-      });
-    };
-
-    const onResult = (
-      _event: Electron.IpcMainEvent,
-      payload: { ok: boolean; error?: string; report?: ProbeReport }
-    ) => {
-      if (settled) {
-        return;
-      }
-
-      settled = true;
-      cleanup();
-
-      if (!payload.ok || !payload.report) {
-        rejectPromise(new Error(payload.error ?? "Probe failed without a report."));
-        return;
-      }
-
-      resolvePromise(payload.report);
-    };
-
-    const onClosed = () => {
-      finishWithError("Probe window closed unexpectedly.");
-    };
-
-    const onDidFailLoad = (...args: any[]) => {
-      const [, code, description] = args;
-      finishWithError(`Probe window failed to load (${code}): ${description}`);
-    };
-
-    ipcMain.once("probe-ready", onReady);
-    ipcMain.once("probe-result", onResult);
-    probeWindow.once("closed", onClosed);
-    webContentsEvents.once("did-fail-load", onDidFailLoad);
-
-    void probeWindow.loadURL("data:text/html,<html><body></body></html>").catch((error: unknown) => {
-      finishWithError(error instanceof Error ? error.message : String(error));
-    });
-  });
+  Object.assign(options, overrides);
+  const report = probeModule.runProbe(options) as ProbeReport;
 
   const paths = writeProbeReport(report);
 
