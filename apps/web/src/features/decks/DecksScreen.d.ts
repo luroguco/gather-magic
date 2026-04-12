@@ -1,0 +1,40 @@
+import type { Deck, DeckListItem, ValidationResult } from "../../types";
+type DeckDisplayCard = {
+    cardId: string;
+    section: "main" | "sideboard" | "commander";
+    quantity: number;
+    displayName: string;
+    displayTypeLine: string;
+    displayManaValue: number;
+    displayOwnedCount: number;
+};
+type DeckCardGroup = {
+    key: string;
+    label: string;
+    items: DeckDisplayCard[];
+};
+type DecksScreenProps = {
+    deckList: DeckListItem[];
+    activeDeck: Deck | null;
+    deckName: string;
+    deckFormat: Deck["format"];
+    onDeckNameChange: (value: string) => void;
+    onDeckFormatChange: (value: Deck["format"]) => void;
+    onCreateDeck: () => void;
+    onSelectDeck: (deckId: string) => void;
+    onSaveDeck: (deck: Deck) => void;
+    validation: ValidationResult | null;
+    onRefreshValidation: (deckId: string) => Promise<void>;
+    onRefreshExport: (deckId: string) => Promise<void>;
+    exportText: string;
+    deckSort: "added" | "name" | "manaValue" | "typeLine" | "quantity";
+    deckGroup: "none" | "section" | "typeLine" | "manaValue";
+    onDeckSortChange: (value: "added" | "name" | "manaValue" | "typeLine" | "quantity") => void;
+    onDeckGroupChange: (value: "none" | "section" | "typeLine" | "manaValue") => void;
+    sortedDeckDisplayCards: DeckDisplayCard[];
+    deckCardGroups: DeckCardGroup[];
+    onChangeDeckQuantity: (cardId: string, section: "main" | "sideboard" | "commander", delta: number) => void;
+    onActiveDeckChange: (deck: Deck) => void;
+};
+export declare function DecksScreen({ deckList, activeDeck, deckName, deckFormat, onDeckNameChange, onDeckFormatChange, onCreateDeck, onSelectDeck, onSaveDeck, validation, onRefreshValidation, onRefreshExport, exportText, deckSort, deckGroup, onDeckSortChange, onDeckGroupChange, sortedDeckDisplayCards, deckCardGroups, onChangeDeckQuantity, onActiveDeckChange }: DecksScreenProps): import("react/jsx-runtime").JSX.Element;
+export {};
