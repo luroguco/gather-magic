@@ -176,3 +176,24 @@ export const untappedCollectionJson = JSON.stringify(
   null,
   2
 );
+
+export const collectorSnapshotJson = JSON.stringify(
+  {
+    snapshotVersion: 1,
+    capturedAt: "2026-04-03T02:15:00.000Z",
+    platform: "darwin",
+    collectorVersion: "0.1.0",
+    mtgaPid: 11955,
+    diagnostics: {
+      source: "runtime-direct",
+      warnings: ["attach failed"]
+    },
+    collection: {
+      1001: 2,
+      1002: 1,
+      9999: 4
+    }
+  },
+  null,
+  2
+);

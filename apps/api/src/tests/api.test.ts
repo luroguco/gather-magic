@@ -1,6 +1,6 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { DbHandle } from "../lib/database.js";
@@ -8,7 +8,13 @@ import { createDatabase } from "../lib/database.js";
 import { buildApp } from "../app.js";
 import { importCollectionCsv } from "../services/collectionImport.js";
 import { syncCardsFromBulkData } from "../services/cardData.js";
-import { duplicateVariantCollectionCsv, fixtureCards, untappedCollectionJson, validCollectionCsv } from "./fixtures.js";
+import {
+  collectorSnapshotJson,
+  duplicateVariantCollectionCsv,
+  fixtureCards,
+  untappedCollectionJson,
+  validCollectionCsv
+} from "./fixtures.js";
 
 const buildMultipartFilePayload = (filename: string, content: string, contentType: string) => {
   const boundary = "----mtga-test-boundary";
@@ -38,6 +44,8 @@ describe("MTGA collection API", () => {
   let helperRoot: string;
   let untappedConfigPath: string;
   let untappedDownloadsPath: string;
+  let collectorSnapshotPath: string;
+  let collectorAddonPath: string;
 
   beforeEach(() => {
     db = createDatabase(":memory:");
@@ -45,12 +53,25 @@ describe("MTGA collection API", () => {
     helperRoot = mkdtempSync(resolve(tmpdir(), "mtga-untapped-helper-"));
     untappedConfigPath = resolve(helperRoot, "config.json");
     untappedDownloadsPath = resolve(helperRoot, "Downloads");
+    collectorSnapshotPath = resolve(helperRoot, "collector/latest-collector-snapshot.json");
+    collectorAddonPath = resolve(helperRoot, "untapped-scry.node");
     mkdirSync(untappedDownloadsPath, { recursive: true });
     writeFileSync(untappedConfigPath, JSON.stringify({ showDevTools: false }, null, 2));
+    writeFileSync(collectorAddonPath, "test-addon");
     app = buildApp(db, {
       untappedCatalogSource: "database",
       untappedConfigPath,
-      untappedDownloadsPath
+      untappedDownloadsPath,
+      collectorHelperOptions: {
+        snapshotPath: collectorSnapshotPath,
+        scryAddonPath: collectorAddonPath,
+        codesignAvailable: true,
+        mtgaPid: 11955,
+        captureRunner: (snapshotPath) => {
+          mkdirSync(dirname(snapshotPath), { recursive: true });
+          writeFileSync(snapshotPath, collectorSnapshotJson);
+        }
+      }
     });
   });
 
@@ -140,6 +161,123 @@ describe("MTGA collection API", () => {
     expect(payload.total).toBe(1);
     expect(payload.items[0].ownedCount).toBe(4);
     expect(payload.items[0].rawOwnedCount).toBe(4);
+  });
+
+  it("filters search results by playable owned count", async () => {
+    importCollectionCsv(db, validCollectionCsv);
+
+    const minResponse = await app.inject({
+      method: "GET",
+      url: "/api/cards/search?playableCountMin=2"
+    });
+    expect(minResponse.statusCode).toBe(200);
+    expect(minResponse.json().items.map((item: { name: string }) => item.name)).toEqual(["Angelic Blink"]);
+
+    const maxResponse = await app.inject({
+      method: "GET",
+      url: "/api/cards/search?ownedOnly=true&playableCountMax=1"
+    });
+    expect(maxResponse.statusCode).toBe(200);
+    expect(maxResponse.json().items.map((item: { name: string }) => item.name).sort()).toEqual([
+      "Grave Whisper",
+      "Unknown Card"
+    ]);
+  });
+
+  it("returns owned-collection stats with playable ownership totals and breakdowns", async () => {
+    importCollectionCsv(db, validCollectionCsv);
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/stats/cards?ownedOnly=true"
+    });
+
+    expect(response.statusCode).toBe(200);
+    const payload = response.json();
+    expect(payload.scope.ownedOnly).toBe(true);
+    expect(payload.summary.matchingTitles).toBe(3);
+    expect(payload.summary.playableOwnedCopies).toBe(4);
+    expect(payload.summary.rawOwnedCopies).toBe(4);
+    expect(payload.summary.setsRepresented).toBe(1);
+    expect(payload.summary.mechanicsRepresented).toBeGreaterThan(0);
+    expect(payload.breakdowns.colors.map((item: { key: string }) => item.key).sort()).toEqual([
+      "mono-black",
+      "mono-blue",
+      "mono-white"
+    ]);
+    expect(payload.breakdowns.types.map((item: { key: string }) => item.key).sort()).toEqual([
+      "creature",
+      "other",
+      "sorcery"
+    ]);
+  });
+
+  it("returns full-catalog stats and respects filters", async () => {
+    importCollectionCsv(db, validCollectionCsv);
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/stats/cards?format=standard&types=Creature"
+    });
+
+    expect(response.statusCode).toBe(200);
+    const payload = response.json();
+    expect(payload.scope.ownedOnly).toBe(false);
+    expect(payload.scope.filtersApplied.format).toBe("standard");
+    expect(payload.scope.filtersApplied.types).toEqual(["Creature"]);
+    expect(payload.summary.matchingTitles).toBe(2);
+    expect(payload.breakdowns.types).toEqual([
+      {
+        key: "creature",
+        label: "Creature",
+        titleCount: 2,
+        playableOwnedCopies: 2,
+        rawOwnedCopies: 2
+      }
+    ]);
+  });
+
+  it("supports exact metric drilldowns in card search", async () => {
+    importCollectionCsv(db, validCollectionCsv);
+
+    const colorResponse = await app.inject({
+      method: "GET",
+      url: "/api/cards/search?ownedOnly=true&drilldownKind=color&drilldownKey=mono-white"
+    });
+    expect(colorResponse.statusCode).toBe(200);
+    expect(colorResponse.json().items.map((item: { name: string }) => item.name)).toEqual(["Angelic Blink"]);
+
+    const rarityResponse = await app.inject({
+      method: "GET",
+      url: "/api/cards/search?drilldownKind=rarity&drilldownKey=rare"
+    });
+    expect(rarityResponse.statusCode).toBe(200);
+    expect(rarityResponse.json().items.map((item: { name: string }) => item.name).sort()).toEqual([
+      "Angelic Blink",
+      "Dawnfall",
+      "Unknown Card"
+    ]);
+
+    const mechanicResponse = await app.inject({
+      method: "GET",
+      url: "/api/cards/search?ownedOnly=true&drilldownKind=mechanic&drilldownKey=flying"
+    });
+    expect(mechanicResponse.statusCode).toBe(200);
+    expect(mechanicResponse.json().items.map((item: { name: string }) => item.name)).toEqual(["Angelic Blink"]);
+  });
+
+  it("limits mechanic stats to the filtered subset without duplicate inflation", async () => {
+    importCollectionCsv(db, validCollectionCsv);
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/stats/cards?ownedOnly=true&q=Angelic"
+    });
+
+    expect(response.statusCode).toBe(200);
+    const payload = response.json();
+    expect(payload.summary.matchingTitles).toBe(1);
+    expect(payload.breakdowns.mechanics.every((item: { titleCount: number }) => item.titleCount === 1)).toBe(true);
   });
 
   it("starts the untapped helper and reports local capture status", async () => {
@@ -258,6 +396,119 @@ describe("MTGA collection API", () => {
       "Angelic Blink",
       "Grave Whisper"
     ]);
+  });
+
+  it("previews collector snapshot JSON with snapshot metadata", async () => {
+    const multipart = buildMultipartFilePayload(
+      "mtga-collector-snapshot.json",
+      collectorSnapshotJson,
+      "application/json"
+    );
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/imports/collector-snapshot/preview",
+      payload: multipart.payload,
+      headers: multipart.headers
+    });
+
+    expect(response.statusCode).toBe(200);
+    const payload = response.json();
+    expect(payload.source).toBe("collector-snapshot");
+    expect(payload.extractedPath).toBe("root.collection");
+    expect(payload.snapshotMetadata).toEqual({
+      snapshotVersion: 1,
+      capturedAt: "2026-04-03T02:15:00.000Z",
+      platform: "darwin",
+      collectorVersion: "0.1.0",
+      mtgaPid: 11955,
+      diagnostics: {
+        source: "runtime-direct",
+        warnings: ["attach failed"]
+      }
+    });
+    expect(payload.matchedGrpIds).toBe(2);
+    expect(payload.unmatchedGrpIds).toBe(1);
+    expect(payload.ownedTitles).toBe(2);
+    expect(payload.ownedCopies).toBe(3);
+  });
+
+  it("imports collector snapshot JSON and replaces the stored snapshot", async () => {
+    const multipart = buildMultipartFilePayload(
+      "mtga-collector-snapshot.json",
+      collectorSnapshotJson,
+      "application/json"
+    );
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/imports/collector-snapshot",
+      payload: multipart.payload,
+      headers: multipart.headers
+    });
+
+    expect(response.statusCode).toBe(200);
+    const payload = response.json();
+    expect(payload.source).toBe("collector-snapshot");
+    expect(typeof payload.importedAt).toBe("string");
+    expect(payload.snapshotMetadata.snapshotVersion).toBe(1);
+    expect(payload.ownedTitles).toBe(2);
+    expect(payload.ownedCopies).toBe(3);
+
+    const statusResponse = await app.inject({
+      method: "GET",
+      url: "/api/status"
+    });
+    expect(statusResponse.statusCode).toBe(200);
+    expect(statusResponse.json().collection.ownedEntries).toBe(2);
+    expect(statusResponse.json().collection.ownedCopies).toBe(3);
+  });
+
+  it("captures, previews, and imports the latest collector snapshot through the local helper", async () => {
+    const statusResponse = await app.inject({
+      method: "GET",
+      url: "/api/imports/collector-helper/status"
+    });
+
+    expect(statusResponse.statusCode).toBe(200);
+    expect(statusResponse.json()).toMatchObject({
+      available: true,
+      addonAvailable: true,
+      mtgaRunning: true,
+      latestCapture: null
+    });
+
+    const capturePreviewResponse = await app.inject({
+      method: "POST",
+      url: "/api/imports/collector-helper/capture-preview"
+    });
+
+    expect(capturePreviewResponse.statusCode).toBe(200);
+    const capturePreviewPayload = capturePreviewResponse.json();
+    expect(capturePreviewPayload.capture.filename).toBe("latest-collector-snapshot.json");
+    expect(capturePreviewPayload.snapshotMetadata.snapshotVersion).toBe(1);
+    expect(capturePreviewPayload.ownedTitles).toBe(2);
+    expect(capturePreviewPayload.ownedCopies).toBe(3);
+
+    const previewLatestResponse = await app.inject({
+      method: "POST",
+      url: "/api/imports/collector-helper/preview-latest"
+    });
+
+    expect(previewLatestResponse.statusCode).toBe(200);
+    expect(previewLatestResponse.json().capture.filename).toBe("latest-collector-snapshot.json");
+
+    const importLatestResponse = await app.inject({
+      method: "POST",
+      url: "/api/imports/collector-helper/import-latest"
+    });
+
+    expect(importLatestResponse.statusCode).toBe(200);
+    const importLatestPayload = importLatestResponse.json();
+    expect(typeof importLatestPayload.importedAt).toBe("string");
+    expect(importLatestPayload.capture.filename).toBe("latest-collector-snapshot.json");
+    expect(importLatestPayload.ownedTitles).toBe(2);
+    expect(importLatestPayload.ownedCopies).toBe(3);
   });
 
   it("creates, validates, and exports decks", async () => {

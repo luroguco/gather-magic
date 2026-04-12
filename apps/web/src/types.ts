@@ -62,6 +62,51 @@ export type SearchResponse = {
   items: CardSummary[];
 };
 
+export type StatsBreakdownItem = {
+  key: string;
+  label: string;
+  titleCount: number;
+  playableOwnedCopies: number;
+  rawOwnedCopies: number;
+};
+
+export type CardStatsResponse = {
+  scope: {
+    ownedOnly: boolean;
+    filtersApplied: {
+      q?: string;
+      format?: ArenaFormat;
+      colors: string[];
+      mechanics: string[];
+      types: string[];
+      subtypes: string[];
+      rarity: string[];
+      sets: string[];
+      playableCountMin?: number;
+      playableCountMax?: number;
+      manaValueMin?: number;
+      manaValueMax?: number;
+    };
+  };
+  summary: {
+    matchingTitles: number;
+    playableOwnedCopies: number;
+    rawOwnedCopies: number;
+    averageManaValue: number;
+    colorBucketsRepresented: number;
+    setsRepresented: number;
+    mechanicsRepresented: number;
+  };
+  breakdowns: {
+    colors: StatsBreakdownItem[];
+    manaValues: StatsBreakdownItem[];
+    types: StatsBreakdownItem[];
+    rarities: StatsBreakdownItem[];
+    sets: StatsBreakdownItem[];
+    mechanics: StatsBreakdownItem[];
+  };
+};
+
 export type DeckCard = {
   cardId: string;
   quantity: number;
@@ -122,11 +167,24 @@ export type AppStatus = {
   };
 };
 
-export type UntappedImportSummary = {
-  source: "untapped-json";
+export type CollectorSnapshotMetadata = {
+  snapshotVersion: number;
+  capturedAt?: string;
+  platform?: string;
+  collectorVersion?: string;
+  mtgaPid?: number;
+  diagnostics?: {
+    source?: string;
+    warnings?: string[];
+  };
+};
+
+export type CollectionImportSummary = {
+  source: "untapped-json" | "collector-snapshot";
   importedAt?: string;
   extractedPath: string;
   catalogSource: "database" | "untapped-public";
+  snapshotMetadata?: CollectorSnapshotMetadata;
   catalogMetadata?: {
     build?: string | null;
     locale?: string;
@@ -154,6 +212,31 @@ export type UntappedImportSummary = {
     changedTitles: number;
     unchangedTitles: number;
   };
+};
+
+export type UntappedImportSummary = CollectionImportSummary;
+
+export type CollectorCaptureFile = {
+  path: string;
+  filename: string;
+  size: number;
+  modifiedAt: string;
+};
+
+export type CollectorCaptureStatus = {
+  available: boolean;
+  snapshotPath: string;
+  addonPath: string;
+  addonAvailable: boolean;
+  codesignAvailable: boolean;
+  scriptAvailable: boolean;
+  mtgaRunning: boolean;
+  mtgaPid: number | null;
+  latestCapture: CollectorCaptureFile | null;
+};
+
+export type CollectorCaptureImportSummary = CollectionImportSummary & {
+  capture: CollectorCaptureFile;
 };
 
 export type UntappedCaptureFile = {

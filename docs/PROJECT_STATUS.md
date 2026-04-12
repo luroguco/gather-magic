@@ -13,6 +13,9 @@ Core goals:
 AI planning exists separately in:
 - [AI_ASSISTANT_PLAN.md](/Users/luisgutierrez/Documents/Development/Projects/mtg collection/docs/AI_ASSISTANT_PLAN.md)
 
+Collector app planning exists separately in:
+- [COLLECTOR_APP_PLAN.md](/Users/luisgutierrez/Documents/Development/Projects/mtg collection/docs/COLLECTOR_APP_PLAN.md)
+
 ## Current Stack
 
 - React + Vite frontend

@@ -1,6 +1,10 @@
 import type {
   AppStatus,
+  CardStatsResponse,
   CardDetail,
+  CollectionImportSummary,
+  CollectorCaptureImportSummary,
+  CollectorCaptureStatus,
   Deck,
   DeckCard,
   DeckListItem,
@@ -22,7 +26,20 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, init);
   if (!response.ok) {
     const text = await response.text();
-    throw new Error(text || `Request failed with ${response.status}`);
+    let parsedError: string | null = null;
+
+    if (text.trim().startsWith("{")) {
+      try {
+        const parsed = JSON.parse(text) as { error?: string };
+        if (typeof parsed.error === "string" && parsed.error.trim().length > 0) {
+          parsedError = parsed.error;
+        }
+      } catch {
+        // Fall through to the raw text if the error payload is not valid JSON.
+      }
+    }
+
+    throw new Error(parsedError ?? (text || `Request failed with ${response.status}`));
   }
   return (await response.json()) as T;
 }
@@ -40,6 +57,9 @@ export const getMechanics = async (options?: { ownedOnly?: boolean }) => {
 
 export const searchCards = (params: URLSearchParams) =>
   request<SearchResponse>(`/api/cards/search?${params.toString()}`);
+
+export const getCardStats = (params: URLSearchParams) =>
+  request<CardStatsResponse>(`/api/stats/cards?${params.toString()}`);
 
 export const getCard = (id: string) => request<CardDetail>(`/api/cards/${id}`);
 
@@ -75,6 +95,42 @@ export const importUntappedCollection = async (file: File) => {
     body: formData
   });
 };
+
+export const previewCollectorSnapshot = async (file: File) => {
+  const formData = new FormData();
+  formData.append("file", file);
+  return request<CollectionImportSummary>("/api/imports/collector-snapshot/preview", {
+    method: "POST",
+    body: formData
+  });
+};
+
+export const importCollectorSnapshot = async (file: File) => {
+  const formData = new FormData();
+  formData.append("file", file);
+  return request<CollectionImportSummary>("/api/imports/collector-snapshot", {
+    method: "POST",
+    body: formData
+  });
+};
+
+export const getCollectorHelperStatus = () =>
+  request<CollectorCaptureStatus>("/api/imports/collector-helper/status");
+
+export const capturePreviewCollectorSnapshot = () =>
+  request<CollectorCaptureImportSummary>("/api/imports/collector-helper/capture-preview", {
+    method: "POST"
+  });
+
+export const previewLatestCollectorSnapshot = () =>
+  request<CollectorCaptureImportSummary>("/api/imports/collector-helper/preview-latest", {
+    method: "POST"
+  });
+
+export const importLatestCollectorSnapshot = () =>
+  request<CollectorCaptureImportSummary>("/api/imports/collector-helper/import-latest", {
+    method: "POST"
+  });
 
 export const getUntappedHelperStatus = () =>
   request<UntappedCaptureStatus>("/api/imports/untapped-helper/status");

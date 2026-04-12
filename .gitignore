@@ -1,5 +1,7 @@
 node_modules
 dist
+apps/api/out
+apps/collector/out
 .vite
 .turbo
 coverage

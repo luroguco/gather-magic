@@ -1,0 +1,24 @@
+{
+  "name": "@mtga/collector",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "main": "dist/main.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json && cp src/index.html dist/index.html && cp src/renderer.js dist/renderer.js && cp src/uiPreload.cjs dist/uiPreload.cjs && cp src/probePreload.cjs dist/probePreload.cjs",
+    "dev": "npm run build && npm run start",
+    "lint": "tsc -p tsconfig.json --noEmit",
+    "package:mac": "npm run build && node dist/packageMac.js",
+    "package:mac:adhoc": "npm run build && node dist/packageMac.js --adhoc-sign",
+    "package:mac:signed": "npm run build && node dist/packageMac.js --sign",
+    "probe:packaged": "node dist/runPackagedProbe.js",
+    "probe:runtime": "npm run build && env -u ELECTRON_RUN_AS_NODE electron dist/main.js --run-runtime-probe",
+    "start": "env -u ELECTRON_RUN_AS_NODE electron dist/main.js"
+  },
+  "devDependencies": {
+    "@electron/osx-sign": "^2.3.0",
+    "@electron/packager": "^19.1.0",
+    "@types/node": "^24.6.0",
+    "electron": "^41.1.0"
+  }
+}

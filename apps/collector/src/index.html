@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>MTGA Collector Host Spike</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        font-family: "Avenir Next", "Segoe UI", sans-serif;
+        background:
+          radial-gradient(circle at top, rgba(45, 167, 146, 0.18), transparent 36%),
+          radial-gradient(circle at right, rgba(29, 89, 138, 0.18), transparent 28%),
+          linear-gradient(135deg, #08151d 0%, #10202d 52%, #11161d 100%);
+        color: #eef6ff;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        padding: 28px;
+        background: transparent;
+      }
+
+      main {
+        max-width: 1120px;
+        margin: 0 auto;
+        display: grid;
+        gap: 18px;
+      }
+
+      .hero,
+      .panel {
+        border: 1px solid rgba(173, 219, 255, 0.14);
+        border-radius: 22px;
+        background: rgba(8, 18, 27, 0.76);
+        backdrop-filter: blur(20px);
+        box-shadow: 0 18px 48px rgba(0, 0, 0, 0.28);
+      }
+
+      .hero {
+        padding: 24px;
+        display: grid;
+        gap: 10px;
+      }
+
+      h1,
+      h2 {
+        margin: 0;
+        font-family: "Iowan Old Style", "Palatino Linotype", serif;
+      }
+
+      p {
+        margin: 0;
+        color: rgba(238, 246, 255, 0.76);
+      }
+
+      .panel {
+        padding: 20px;
+        display: grid;
+        gap: 16px;
+      }
+
+      .meta-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 12px;
+      }
+
+      .meta-card {
+        padding: 14px 16px;
+        border-radius: 16px;
+        background: rgba(16, 32, 46, 0.74);
+        border: 1px solid rgba(173, 219, 255, 0.12);
+      }
+
+      .meta-card span {
+        display: block;
+        margin-bottom: 6px;
+        color: rgba(238, 246, 255, 0.62);
+        font-size: 0.82rem;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+      }
+
+      .controls {
+        display: flex;
+        gap: 12px;
+        align-items: end;
+        flex-wrap: wrap;
+      }
+
+      label {
+        display: grid;
+        gap: 8px;
+        min-width: 240px;
+      }
+
+      input,
+      button {
+        font: inherit;
+      }
+
+      input {
+        padding: 12px 14px;
+        border-radius: 14px;
+        border: 1px solid rgba(173, 219, 255, 0.16);
+        background: rgba(9, 16, 22, 0.82);
+        color: inherit;
+      }
+
+      button {
+        border: 1px solid rgba(126, 232, 203, 0.34);
+        border-radius: 999px;
+        padding: 12px 18px;
+        color: #061014;
+        background: linear-gradient(135deg, #64f0ca 0%, #39b0ff 100%);
+        cursor: pointer;
+        font-weight: 700;
+      }
+
+      button:disabled {
+        cursor: wait;
+        opacity: 0.7;
+      }
+
+      .banner {
+        padding: 12px 14px;
+        border-radius: 16px;
+        border: 1px solid rgba(173, 219, 255, 0.12);
+        background: rgba(9, 16, 22, 0.72);
+      }
+
+      .banner.error {
+        border-color: rgba(255, 142, 142, 0.3);
+        color: #ffb7b7;
+      }
+
+      pre {
+        margin: 0;
+        padding: 16px;
+        border-radius: 16px;
+        background: rgba(5, 11, 16, 0.94);
+        border: 1px solid rgba(173, 219, 255, 0.1);
+        color: #d7f6ef;
+        white-space: pre-wrap;
+        word-break: break-word;
+        overflow: auto;
+        max-height: 420px;
+      }
+
+      code {
+        font-family: "SFMono-Regular", "Menlo", monospace;
+      }
+
+      @media (max-width: 800px) {
+        body {
+          padding: 18px;
+        }
+
+        .meta-grid {
+          grid-template-columns: 1fr;
+        }
+
+        label {
+          min-width: 100%;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <section class="hero">
+        <h1>MTGA Collector Host Spike</h1>
+        <p>
+          Phase 0 only. This app exists to answer one question: can our own desktop host run the
+          MTGA runtime probe cleanly enough to replace the DevTools import hack?
+        </p>
+      </section>
+
+      <section class="panel">
+        <h2>Probe Status</h2>
+        <div id="statusBanner" class="banner">Loading collector status...</div>
+        <div class="meta-grid">
+          <div class="meta-card">
+            <span>Platform</span>
+            <strong id="platformValue">-</strong>
+          </div>
+          <div class="meta-card">
+            <span>Probe Module</span>
+            <code id="probePathValue">-</code>
+          </div>
+          <div class="meta-card">
+            <span>Collector Data Dir</span>
+            <code id="dataDirValue">-</code>
+          </div>
+          <div class="meta-card">
+            <span>Latest Report</span>
+            <code id="latestReportValue">-</code>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>Run Runtime Probe</h2>
+        <div class="controls">
+          <label>
+            <span>Optional MTGA PID Override</span>
+            <input id="pidInput" inputmode="numeric" placeholder="Auto-detect by default" />
+          </label>
+          <button id="runProbeButton" type="button">Run Attach Smoke Test</button>
+        </div>
+        <div id="runBanner" class="banner">
+          The probe imports <code>apps/api/dist/scripts/probeMtgaRuntime.js</code> and writes JSON
+          reports under <code>data/collector/</code>.
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>Summary</h2>
+        <pre id="summaryOutput">No probe run yet.</pre>
+      </section>
+
+      <section class="panel">
+        <h2>Latest Report JSON</h2>
+        <pre id="jsonOutput">No probe run yet.</pre>
+      </section>
+    </main>
+
+    <script src="./renderer.js"></script>
+  </body>
+</html>

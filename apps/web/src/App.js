@@ -1,7 +1,7 @@
 import { jsx as _jsx, jsxs as _jsxs, Fragment as _Fragment } from "react/jsx-runtime";
 import { useDeferredValue, useEffect, useRef, useState, startTransition } from "react";
 import { CardCornerVisual, CardMetaSummary, ColorStrip, getCardAccentColors, getMechanicSummary, OwnershipDots, RenderOraclePreview, trailingActionButtons, VerticalColorStrip } from "./cardPresentation";
-import { createDeck, exportDeck, getCard, getDeck, getMechanics, getStatus, getUntappedHelperStatus, importUntappedCollection, importLatestUntappedCapture, listDecks, previewUntappedCollection, previewLatestUntappedCapture, startUntappedHelper, stopUntappedHelper, searchCards, updateDeck, uploadCollection, validateDeck } from "./api";
+import { capturePreviewCollectorSnapshot, createDeck, exportDeck, getCard, getCardStats, getCollectorHelperStatus, importCollectorSnapshot, getDeck, getMechanics, getStatus, importLatestCollectorSnapshot, getUntappedHelperStatus, importUntappedCollection, importLatestUntappedCapture, listDecks, previewLatestCollectorSnapshot, previewCollectorSnapshot, previewUntappedCollection, previewLatestUntappedCapture, startUntappedHelper, stopUntappedHelper, searchCards, updateDeck, uploadCollection, validateDeck } from "./api";
 const FORMATS = [
     ["standard", "Standard"],
     ["alchemy", "Alchemy"],
@@ -14,7 +14,7 @@ const FORMATS = [
 const COLORS = ["W", "U", "B", "R", "G"];
 const CARD_TYPES = ["Creature", "Instant", "Sorcery", "Artifact", "Enchantment", "Planeswalker", "Land"];
 const RARITIES = ["common", "uncommon", "rare", "mythic"];
-const defaultSearch = {
+const defaultFilterState = {
     q: "",
     format: "standard",
     colors: [],
@@ -22,9 +22,24 @@ const defaultSearch = {
     types: [],
     subtypes: "",
     rarity: [],
-    ownedOnly: false,
+    playableCountMin: "",
+    playableCountMax: "",
     manaValueMin: "",
     manaValueMax: ""
+};
+const defaultSearch = {
+    ...defaultFilterState,
+    ownedOnly: false,
+    drilldownKind: "",
+    drilldownKey: "",
+    drilldownLabel: ""
+};
+const defaultStatsFilters = {
+    ...defaultFilterState,
+    ownedOnly: true,
+    drilldownKind: "",
+    drilldownKey: "",
+    drilldownLabel: ""
 };
 const FAVORITES_STORAGE_KEY = "mtga.favorite-mechanics";
 const RESULT_VIEW_STORAGE_KEY = "mtga.search-results-view";
@@ -174,16 +189,48 @@ const buildSearchParams = (state) => {
     if (state.ownedOnly) {
         params.set("ownedOnly", "true");
     }
+    if (state.playableCountMin) {
+        params.set("playableCountMin", state.playableCountMin);
+    }
+    if (state.playableCountMax) {
+        params.set("playableCountMax", state.playableCountMax);
+    }
     if (state.manaValueMin) {
         params.set("manaValueMin", state.manaValueMin);
     }
     if (state.manaValueMax) {
         params.set("manaValueMax", state.manaValueMax);
     }
+    if (state.drilldownKind && state.drilldownKey) {
+        params.set("drilldownKind", state.drilldownKind);
+        params.set("drilldownKey", state.drilldownKey);
+    }
     params.set("page", "1");
     params.set("pageSize", String(SEARCH_PAGE_SIZE));
     return params;
 };
+const getPrimaryBreakdownValue = (item, ownedOnly) => ownedOnly ? item.playableOwnedCopies : item.titleCount;
+const formatBreakdownMetricLabel = (ownedOnly) => (ownedOnly ? "playable copies" : "titles");
+const mergeSharedFilterFields = (target, source) => ({
+    ...target,
+    q: source.q,
+    format: source.format,
+    colors: [...source.colors],
+    mechanics: [...source.mechanics],
+    types: [...source.types],
+    subtypes: source.subtypes,
+    rarity: [...source.rarity],
+    playableCountMin: source.playableCountMin,
+    playableCountMax: source.playableCountMax,
+    manaValueMin: source.manaValueMin,
+    manaValueMax: source.manaValueMax
+});
+const clearDrilldownState = (state) => ({
+    ...state,
+    drilldownKind: "",
+    drilldownKey: "",
+    drilldownLabel: ""
+});
 const mergeDeckCard = (cards, cardId, section) => {
     const existing = cards.find((card) => card.cardId === cardId && card.section === section);
     if (!existing) {
@@ -204,6 +251,16 @@ const formatCatalogLabel = (preview) => {
     const buildLabel = preview.catalogMetadata?.build ? ` build ${preview.catalogMetadata.build}` : "";
     return `Untapped public${buildLabel}`;
 };
+const formatImportPreviewContext = (preview) => {
+    const parts = [formatCatalogLabel(preview)];
+    if (preview.snapshotMetadata?.capturedAt) {
+        parts.push(`Captured ${formatDateTime(preview.snapshotMetadata.capturedAt)}`);
+    }
+    if (preview.snapshotMetadata?.collectorVersion) {
+        parts.push(`Collector ${preview.snapshotMetadata.collectorVersion}`);
+    }
+    return parts.join(" · ");
+};
 const formatOwnedCount = (card) => {
     if (card.rawOwnedCount <= 0) {
         return "0 owned";
@@ -221,15 +278,20 @@ const getDeckTypeBucket = (typeLine) => CARD_TYPES.find((type) => typeLine.toLow
 const getUntappedSearchUrl = (cardName) => `https://duckduckgo.com/?q=${encodeURIComponent(`site:mtga.untapped.gg/meta/cards "${cardName}"`)}`;
 const formatFileSize = (size) => size >= 1024 ? `${(size / 1024).toFixed(1)} KB` : `${size} B`;
 const getUntappedCaptureIdentity = (capture) => capture ? `${capture.path}::${capture.modifiedAt}` : null;
+const getCollectorCaptureIdentity = (capture) => capture ? `${capture.path}::${capture.modifiedAt}` : null;
 function App() {
     const [status, setStatus] = useState(null);
     const [mechanics, setMechanics] = useState([]);
     const [searchState, setSearchState] = useState(defaultSearch);
     const deferredSearchState = useDeferredValue(searchState);
+    const [statsState, setStatsState] = useState(defaultStatsFilters);
+    const deferredStatsState = useDeferredValue(statsState);
     const [cards, setCards] = useState([]);
     const [cardsTotal, setCardsTotal] = useState(0);
+    const [cardStats, setCardStats] = useState(null);
     const [visibleResultsCount, setVisibleResultsCount] = useState(INITIAL_VISIBLE_RESULTS);
     const [searchLoading, setSearchLoading] = useState(false);
+    const [statsLoading, setStatsLoading] = useState(false);
     const [deckList, setDeckList] = useState([]);
     const [activeDeck, setActiveDeck] = useState(null);
     const [validation, setValidation] = useState(null);
@@ -241,6 +303,13 @@ function App() {
     const [quickDeckFormat, setQuickDeckFormat] = useState("standard");
     const [importMessage, setImportMessage] = useState("");
     const [errorMessage, setErrorMessage] = useState("");
+    const [collectorSnapshotFile, setCollectorSnapshotFile] = useState(null);
+    const [collectorSnapshotPreview, setCollectorSnapshotPreview] = useState(null);
+    const [collectorSnapshotPreviewLoading, setCollectorSnapshotPreviewLoading] = useState(false);
+    const [collectorSnapshotImporting, setCollectorSnapshotImporting] = useState(false);
+    const [collectorHelperStatus, setCollectorHelperStatus] = useState(null);
+    const [collectorHelperLoading, setCollectorHelperLoading] = useState(false);
+    const [collectorPreviewSource, setCollectorPreviewSource] = useState(null);
     const [untappedFile, setUntappedFile] = useState(null);
     const [untappedPreview, setUntappedPreview] = useState(null);
     const [untappedPreviewLoading, setUntappedPreviewLoading] = useState(false);
@@ -304,6 +373,38 @@ function App() {
         }
         setActiveTab(nextTab);
     };
+    const updateSearchFilters = (updater) => {
+        setSearchState((current) => {
+            const next = updater(current);
+            setStatsState((other) => mergeSharedFilterFields(other, next));
+            return next;
+        });
+    };
+    const updateStatsFilters = (updater) => {
+        setStatsState((current) => {
+            const next = updater(current);
+            setSearchState((other) => mergeSharedFilterFields(other, next));
+            return next;
+        });
+    };
+    const openStatsSearchView = (options) => {
+        const syncedSearchState = mergeSharedFilterFields(defaultSearch, statsState);
+        setSearchState({
+            ...syncedSearchState,
+            ownedOnly: statsState.ownedOnly,
+            drilldownKind: options?.drilldownKind ?? "",
+            drilldownKey: options?.drilldownKey ?? "",
+            drilldownLabel: options?.drilldownLabel ?? ""
+        });
+        switchTab("search");
+    };
+    const openStatsDrilldown = (drilldownKind, item) => {
+        openStatsSearchView({
+            drilldownKind,
+            drilldownKey: item.key,
+            drilldownLabel: item.label
+        });
+    };
     const loadStatus = async () => {
         const nextStatus = await getStatus();
         setStatus(nextStatus);
@@ -311,6 +412,11 @@ function App() {
     const refreshUntappedHelperStatus = async () => {
         const nextStatus = await getUntappedHelperStatus();
         setUntappedHelperStatus(nextStatus);
+        return nextStatus;
+    };
+    const refreshCollectorHelperStatus = async () => {
+        const nextStatus = await getCollectorHelperStatus();
+        setCollectorHelperStatus(nextStatus);
         return nextStatus;
     };
     const copyUntappedSnippetToClipboard = async (snippet) => {
@@ -329,6 +435,7 @@ function App() {
         await loadStatus();
         startTransition(() => {
             setSearchState((current) => ({ ...current }));
+            setStatsState((current) => ({ ...current }));
         });
     };
     const loadDecks = async (selectDeckId) => {
@@ -378,13 +485,34 @@ function App() {
         void runSearch();
     }, [deferredSearchState]);
     useEffect(() => {
+        const runStats = async () => {
+            try {
+                setStatsLoading(true);
+                const response = await getCardStats(buildSearchParams(deferredStatsState));
+                setCardStats(response);
+            }
+            catch (error) {
+                setErrorMessage(error instanceof Error ? error.message : "Card stats failed.");
+            }
+            finally {
+                setStatsLoading(false);
+            }
+        };
+        void runStats();
+    }, [deferredStatsState]);
+    useEffect(() => {
         const runMechanicsRefresh = async () => {
             try {
-                const items = await getMechanics({ ownedOnly: searchState.ownedOnly });
+                const ownedOnly = activeTab === "stats" ? statsState.ownedOnly : searchState.ownedOnly;
+                const items = await getMechanics({ ownedOnly });
                 setMechanics(items);
-                if (searchState.ownedOnly) {
+                if (ownedOnly) {
                     const available = new Set(items.map((item) => item.slug));
                     setSearchState((current) => ({
+                        ...current,
+                        mechanics: current.mechanics.filter((mechanic) => available.has(mechanic))
+                    }));
+                    setStatsState((current) => ({
                         ...current,
                         mechanics: current.mechanics.filter((mechanic) => available.has(mechanic))
                     }));
@@ -395,7 +523,7 @@ function App() {
             }
         };
         void runMechanicsRefresh();
-    }, [searchState.ownedOnly]);
+    }, [activeTab, searchState.ownedOnly, statsState.ownedOnly]);
     useEffect(() => {
         if (typeof window === "undefined") {
             return;
@@ -429,8 +557,8 @@ function App() {
         if (activeTab !== "import") {
             return;
         }
-        void refreshUntappedHelperStatus().catch((error) => {
-            setErrorMessage(error instanceof Error ? error.message : "Failed to load Untapped helper status.");
+        void Promise.all([refreshUntappedHelperStatus(), refreshCollectorHelperStatus()]).catch((error) => {
+            setErrorMessage(error instanceof Error ? error.message : "Failed to load import helper status.");
         });
     }, [activeTab]);
     useEffect(() => {
@@ -594,6 +722,109 @@ function App() {
         }
         catch (error) {
             setErrorMessage(error instanceof Error ? error.message : "Collection import failed.");
+        }
+    };
+    const handleCollectorSnapshotPreview = async (event) => {
+        const file = event.target.files?.[0];
+        event.target.value = "";
+        if (!file) {
+            return;
+        }
+        try {
+            setErrorMessage("");
+            setImportMessage("");
+            setCollectorSnapshotFile(file);
+            setCollectorSnapshotPreview(null);
+            setCollectorPreviewSource("manual-file");
+            setCollectorSnapshotPreviewLoading(true);
+            const preview = await previewCollectorSnapshot(file);
+            setCollectorSnapshotPreview(preview);
+        }
+        catch (error) {
+            setCollectorSnapshotFile(null);
+            setCollectorSnapshotPreview(null);
+            setCollectorPreviewSource(null);
+            setErrorMessage(error instanceof Error ? error.message : "Collector snapshot preview failed.");
+        }
+        finally {
+            setCollectorSnapshotPreviewLoading(false);
+        }
+    };
+    const handleCaptureLatestCollectorSnapshot = async () => {
+        try {
+            setErrorMessage("");
+            setImportMessage("");
+            setCollectorHelperLoading(true);
+            setCollectorSnapshotPreviewLoading(true);
+            setCollectorSnapshotFile(null);
+            setCollectorSnapshotPreview(null);
+            setCollectorPreviewSource("latest-capture");
+            const preview = await capturePreviewCollectorSnapshot();
+            setCollectorSnapshotPreview(preview);
+            setImportMessage(`Captured ${preview.capture.filename}. Review the preview and confirm import when ready.`);
+            await refreshCollectorHelperStatus();
+        }
+        catch (error) {
+            setCollectorPreviewSource(null);
+            setErrorMessage(error instanceof Error ? error.message : "Failed to capture the live MTGA collection.");
+        }
+        finally {
+            setCollectorHelperLoading(false);
+            setCollectorSnapshotPreviewLoading(false);
+        }
+    };
+    const handlePreviewLatestCollectorSnapshot = async () => {
+        try {
+            setErrorMessage("");
+            setImportMessage("");
+            setCollectorHelperLoading(true);
+            setCollectorSnapshotPreviewLoading(true);
+            setCollectorSnapshotFile(null);
+            setCollectorSnapshotPreview(null);
+            setCollectorPreviewSource("latest-capture");
+            const preview = await previewLatestCollectorSnapshot();
+            setCollectorSnapshotPreview(preview);
+            setImportMessage(`Previewed ${preview.capture.filename} from the local collector cache.`);
+            await refreshCollectorHelperStatus();
+        }
+        catch (error) {
+            setCollectorPreviewSource(null);
+            setErrorMessage(error instanceof Error ? error.message : "Failed to preview the latest collector snapshot.");
+        }
+        finally {
+            setCollectorHelperLoading(false);
+            setCollectorSnapshotPreviewLoading(false);
+        }
+    };
+    const handleConfirmCollectorSnapshotImport = async () => {
+        if (!collectorSnapshotFile && collectorPreviewSource !== "latest-capture") {
+            return;
+        }
+        try {
+            setErrorMessage("");
+            setImportMessage("");
+            setCollectorSnapshotImporting(true);
+            let result;
+            if (collectorPreviewSource === "latest-capture") {
+                result = await importLatestCollectorSnapshot();
+            }
+            else if (collectorSnapshotFile) {
+                result = await importCollectorSnapshot(collectorSnapshotFile);
+            }
+            else {
+                throw new Error("Choose a collector snapshot JSON or refresh from MTGA before importing.");
+            }
+            setCollectorSnapshotPreview(result);
+            setImportMessage(`Imported ${result.ownedCopies} playable copies across ${result.ownedTitles} titles from collector snapshot. ` +
+                `${result.unresolvedCards.length} local matches unresolved, ${result.unmatchedGrpIds} grpIds unmatched.`);
+            await refreshCollectionViewsAfterImport();
+            await refreshCollectorHelperStatus();
+        }
+        catch (error) {
+            setErrorMessage(error instanceof Error ? error.message : "Collector snapshot import failed.");
+        }
+        finally {
+            setCollectorSnapshotImporting(false);
         }
     };
     const handleStartUntappedGuide = async () => {
@@ -787,15 +1018,25 @@ function App() {
             mechanic.slug.toLowerCase().includes(query));
     });
     const favoriteSet = new Set(favoriteMechanics);
-    const selectedMechanics = searchState.mechanics
+    const getSelectedMechanics = (state) => state.mechanics
         .map((slug) => sortedMechanics.find((mechanic) => mechanic.slug === slug))
         .filter((mechanic) => Boolean(mechanic));
+    const selectedSearchMechanics = getSelectedMechanics(searchState);
+    const selectedStatsMechanics = getSelectedMechanics(statsState);
+    const sidebarMechanicSelection = activeTab === "stats" ? statsState.mechanics : searchState.mechanics;
     const sidebarFavorites = sortedMechanics.filter((mechanic) => favoriteSet.has(mechanic.slug));
     const sidebarDerivedGroups = groupMechanics(sortedMechanics.filter((mechanic) => mechanic.type === "derived" && !favoriteSet.has(mechanic.slug)), getDerivedBucketId, derivedBucketLabels, derivedBucketOrder);
     const glossaryFavorites = glossaryItems.filter((mechanic) => favoriteSet.has(mechanic.slug));
     const glossaryDerivedGroups = groupMechanics(glossaryItems.filter((mechanic) => mechanic.type === "derived" && !favoriteSet.has(mechanic.slug)), getDerivedBucketId, derivedBucketLabels, derivedBucketOrder);
     const glossaryKeywordGroups = groupMechanics(glossaryItems.filter((mechanic) => mechanic.type === "keyword" && !favoriteSet.has(mechanic.slug)), getKeywordBucketId, keywordBucketLabels, keywordBucketOrder);
     const toggleMechanic = (slug) => {
+        if (activeTab === "stats") {
+            setStatsState((current) => ({
+                ...current,
+                mechanics: toggleValue(current.mechanics, slug)
+            }));
+            return;
+        }
         setSearchState((current) => ({
             ...current,
             mechanics: toggleValue(current.mechanics, slug)
@@ -962,24 +1203,47 @@ function App() {
         }
     };
     const renderDeckDisplayControls = (compact = false) => (_jsxs("div", { className: compact ? "deck-display-toolbar compact" : "deck-display-toolbar", children: [_jsxs("label", { className: "field inline-field", children: [_jsx("span", { children: "Sort" }), _jsxs("select", { value: deckSort, onChange: (event) => setDeckSort(event.target.value), children: [_jsx("option", { value: "added", children: "Added" }), _jsx("option", { value: "name", children: "Name" }), _jsx("option", { value: "manaValue", children: "Cost" }), _jsx("option", { value: "typeLine", children: "Type" }), _jsx("option", { value: "quantity", children: "Quantity" })] })] }), _jsxs("label", { className: "field inline-field", children: [_jsx("span", { children: "Group" }), _jsxs("select", { value: deckGroup, onChange: (event) => setDeckGroup(event.target.value), children: [_jsx("option", { value: "section", children: "Section" }), _jsx("option", { value: "typeLine", children: "Type" }), _jsx("option", { value: "manaValue", children: "Cost" }), _jsx("option", { value: "none", children: "None" })] })] })] }));
+    const renderCollectionImportPreview = (preview, options) => (_jsxs("div", { className: "untapped-preview", children: [_jsxs("div", { className: "panel-header preview-header", children: [_jsxs("div", { children: [_jsx("h3", { children: "Preview" }), _jsxs("span", { children: [formatImportPreviewContext(preview), options.contextSuffix ? ` · ${options.contextSuffix}` : ""] })] }), _jsx("button", { className: "primary-button", disabled: options.importing, onClick: options.onConfirm, type: "button", children: options.importing ? "Importing..." : "Confirm import" })] }), _jsxs("div", { className: "snapshot-grid import-preview-grid", children: [_jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "Owned titles" }), _jsx("strong", { children: preview.ownedTitles })] }), _jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "Playable copies" }), _jsx("strong", { children: preview.ownedCopies })] }), _jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "Variant copies" }), _jsx("strong", { children: preview.rawOwnedCopies })] }), _jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "Matched grpIds" }), _jsx("strong", { children: preview.matchedGrpIds })] }), _jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "Unmatched grpIds" }), _jsx("strong", { children: preview.unmatchedGrpIds })] }), _jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "Extracted path" }), _jsx("strong", { children: preview.extractedPath })] }), preview.snapshotMetadata?.capturedAt ? (_jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "Captured at" }), _jsx("strong", { children: formatDateTime(preview.snapshotMetadata.capturedAt) })] })) : null, preview.snapshotMetadata?.collectorVersion ? (_jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "Collector" }), _jsx("strong", { children: preview.snapshotMetadata.collectorVersion })] })) : null] }), _jsxs("div", { className: "snapshot-grid import-diff-grid", children: [_jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "Added titles" }), _jsx("strong", { children: preview.diff.addedTitles })] }), _jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "Removed titles" }), _jsx("strong", { children: preview.diff.removedTitles })] }), _jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "Changed titles" }), _jsx("strong", { children: preview.diff.changedTitles })] }), _jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "Unchanged titles" }), _jsx("strong", { children: preview.diff.unchangedTitles })] })] }), preview.unresolvedCards.length ? (_jsxs("div", { className: "subpanel import-warning-panel", children: [_jsxs("div", { className: "panel-header", children: [_jsx("h3", { children: "Unresolved local matches" }), _jsx("span", { children: preview.unresolvedCards.length })] }), _jsx("ul", { className: "issue-list", children: preview.unresolvedCards.slice(0, 6).map((entry) => (_jsxs("li", { children: [entry.name, ": ", entry.titleCount, " playable, ", entry.printCount, " variant copies"] }, entry.name))) })] })) : null, preview.unmatchedEntries.length ? (_jsxs("div", { className: "subpanel import-warning-panel", children: [_jsxs("div", { className: "panel-header", children: [_jsx("h3", { children: "Catalog misses" }), _jsx("span", { children: preview.unmatchedEntries.length })] }), _jsx("ul", { className: "issue-list", children: preview.unmatchedEntries.slice(0, 6).map((entry) => (_jsxs("li", { children: ["grpId ", entry.grpId, ": qty ", entry.quantity] }, entry.grpId))) })] })) : null] }));
+    const renderSharedFilters = (state, updateState, options) => (_jsxs(_Fragment, { children: [_jsxs("label", { className: "field", children: [_jsx("span", { children: "Text" }), _jsx("input", { value: state.q, onChange: (event) => updateState((current) => ({ ...current, q: event.target.value })), placeholder: "Search name or oracle text" })] }), _jsxs("label", { className: "field", children: [_jsx("span", { children: "Format" }), _jsx("select", { value: state.format, onChange: (event) => updateState((current) => ({ ...current, format: event.target.value })), children: FORMATS.map(([value, label]) => (_jsx("option", { value: value, children: label }, value))) })] }), _jsxs("label", { className: state.ownedOnly ? "inline-toggle toggle-switch active" : "inline-toggle toggle-switch", children: [_jsx("input", { className: "toggle-switch-input", checked: state.ownedOnly, onChange: (event) => updateState((current) => ({ ...current, ownedOnly: event.target.checked })), type: "checkbox" }), _jsx("span", { className: "toggle-switch-track", "aria-hidden": "true", children: _jsx("span", { className: "toggle-switch-thumb" }) }), _jsxs("span", { className: "toggle-switch-copy", children: [_jsx("strong", { children: options.ownedLabel }), _jsx("small", { children: state.ownedOnly ? options.ownedHintOn : options.ownedHintOff })] })] }), _jsxs("div", { className: "filter-group", children: [_jsx("span", { children: "Colors" }), _jsx("div", { className: "chip-grid", children: COLORS.map((color) => (_jsx("button", { className: state.colors.includes(color) ? "chip active" : "chip", onClick: () => updateState((current) => ({ ...current, colors: toggleValue(current.colors, color) })), type: "button", children: color }, color))) })] }), _jsxs("div", { className: "filter-group", children: [_jsx("span", { children: "Types" }), _jsx("div", { className: "chip-grid", children: CARD_TYPES.map((type) => (_jsx("button", { className: state.types.includes(type) ? "chip active" : "chip", onClick: () => updateState((current) => ({ ...current, types: toggleValue(current.types, type) })), type: "button", children: type }, type))) })] }), _jsxs("label", { className: "field", children: [_jsx("span", { children: "Subtype / tribe" }), _jsx("input", { placeholder: "Kithkin, Shrine, Angel", value: state.subtypes, onChange: (event) => updateState((current) => ({ ...current, subtypes: event.target.value })) })] }), _jsxs("div", { className: "filter-group", children: [_jsx("span", { children: "Rarity" }), _jsx("div", { className: "chip-grid", children: RARITIES.map((rarity) => (_jsx("button", { className: state.rarity.includes(rarity) ? "chip active" : "chip", onClick: () => updateState((current) => ({ ...current, rarity: toggleValue(current.rarity, rarity) })), type: "button", children: rarity }, rarity))) })] }), _jsxs("div", { className: "filter-group", children: [_jsxs("div", { className: "filter-heading", children: [_jsx("span", { children: "Mechanics" }), _jsx("button", { className: "ghost-button subtle-button", onClick: () => setGlossaryOpen(true), type: "button", children: "Glossary" })] }), options.selectedMechanics.length ? (_jsxs("div", { className: "mechanic-section", children: [_jsx("span", { className: "mechanic-section-title", children: "Selected" }), _jsx("div", { className: "chip-grid", children: options.selectedMechanics.map((mechanic) => (_jsx("button", { className: "chip active", title: mechanic.definition, onClick: () => toggleMechanic(mechanic.slug), type: "button", children: mechanic.label }, `selected-${mechanic.slug}`))) })] })) : null, sidebarFavorites.length ? (_jsxs("div", { className: "mechanic-section", children: [_jsx("span", { className: "mechanic-section-title", children: "Pinned" }), _jsx("div", { className: "chip-grid", children: sidebarFavorites.map((mechanic) => (_jsx("button", { className: sidebarMechanicSelection.includes(mechanic.slug) ? "chip active" : "chip", title: mechanic.definition, onClick: () => toggleMechanic(mechanic.slug), type: "button", children: mechanic.label }, `favorite-${mechanic.slug}`))) })] })) : null, sidebarDerivedGroups.map((section) => (_jsxs("div", { className: "mechanic-section", children: [_jsx("span", { className: "mechanic-section-title", children: section.label }), _jsx("div", { className: "chip-grid mechanic-grid compact-grid", children: section.items.map((mechanic) => (_jsx("button", { className: sidebarMechanicSelection.includes(mechanic.slug) ? "chip active" : "chip", title: mechanic.definition, onClick: () => toggleMechanic(mechanic.slug), type: "button", children: mechanic.label }, mechanic.slug))) })] }, `sidebar-${section.id}`)))] }), _jsxs("div", { className: "mana-range", children: [_jsxs("label", { className: "field", children: [_jsx("span", { children: "Playable count min" }), _jsx("input", { inputMode: "numeric", value: state.playableCountMin, onChange: (event) => updateState((current) => ({ ...current, playableCountMin: event.target.value })) })] }), _jsxs("label", { className: "field", children: [_jsx("span", { children: "Playable count max" }), _jsx("input", { inputMode: "numeric", value: state.playableCountMax, onChange: (event) => updateState((current) => ({ ...current, playableCountMax: event.target.value })) })] }), _jsxs("label", { className: "field", children: [_jsx("span", { children: "Mana value min" }), _jsx("input", { inputMode: "numeric", value: state.manaValueMin, onChange: (event) => updateState((current) => ({ ...current, manaValueMin: event.target.value })) })] }), _jsxs("label", { className: "field", children: [_jsx("span", { children: "Mana value max" }), _jsx("input", { inputMode: "numeric", value: state.manaValueMax, onChange: (event) => updateState((current) => ({ ...current, manaValueMax: event.target.value })) })] })] }), _jsx("button", { className: "ghost-button subtle-button filters-clear", onClick: options.onClear, type: "button", children: "Clear filters" })] }));
+    const renderStatsBreakdown = (title, items, drilldownKind, ownedOnly, emptyMessage) => {
+        const maxValue = Math.max(...items.map((entry) => getPrimaryBreakdownValue(entry, ownedOnly)), 1);
+        return (_jsxs("section", { className: "panel stats-section", children: [_jsxs("div", { className: "panel-header", children: [_jsxs("div", { children: [_jsx("h3", { children: title }), _jsxs("span", { children: ["Primary metric: ", formatBreakdownMetricLabel(ownedOnly)] })] }), _jsxs("span", { children: [items.length, " rows"] })] }), items.length ? (_jsx("div", { className: "stats-breakdown-list", children: items.map((item) => {
+                        const primaryValue = getPrimaryBreakdownValue(item, ownedOnly);
+                        const width = `${Math.max((primaryValue / maxValue) * 100, primaryValue > 0 ? 4 : 0)}%`;
+                        return (_jsxs("article", { className: "stats-breakdown-row", children: [_jsxs("div", { className: "stats-breakdown-copy", children: [_jsx("strong", { children: item.label }), _jsxs("span", { children: [item.titleCount, " titles \u00B7 ", item.playableOwnedCopies, " playable \u00B7 ", item.rawOwnedCopies, " raw"] })] }), _jsx("div", { className: "stats-breakdown-bar-shell", "aria-hidden": "true", children: _jsx("div", { className: "stats-breakdown-bar", style: { width } }) }), _jsxs("div", { className: "stats-breakdown-actions", children: [_jsx("strong", { className: "stats-breakdown-value", children: primaryValue.toLocaleString() }), _jsx("button", { className: "ghost-button subtle-button", onClick: () => openStatsDrilldown(drilldownKind, item), type: "button", children: "View cards" })] })] }, `${title}-${item.key}`));
+                    }) })) : (_jsx("div", { className: "stats-empty-message", children: emptyMessage }))] }));
+    };
+    const statsSummaryCards = cardStats
+        ? [
+            { label: "Matching titles", value: cardStats.summary.matchingTitles },
+            { label: "Playable owned copies", value: cardStats.summary.playableOwnedCopies },
+            { label: "Raw owned copies", value: cardStats.summary.rawOwnedCopies },
+            { label: "Average mana value", value: cardStats.summary.averageManaValue },
+            { label: "Sets represented", value: cardStats.summary.setsRepresented },
+            { label: "Mechanics represented", value: cardStats.summary.mechanicsRepresented }
+        ]
+        : [];
     return (_jsxs("div", { className: "app-shell", children: [_jsxs("header", { className: "app-header", children: [_jsxs("div", { className: "app-header-left", children: [_jsx("div", { className: "app-brand compact-brand", children: _jsx("h1", { children: "Collection Explorer" }) }), _jsx("nav", { className: "tab-strip app-tabs compact-tabs", children: [
                                     ["search", "Search"],
+                                    ["stats", "Stats"],
                                     ["decks", "Decks"]
-                                ].map(([tab, label]) => (_jsx("button", { className: activeTab === tab ? "tab-button active" : "tab-button", onClick: () => switchTab(tab), type: "button", children: label }, tab))) })] }), _jsxs("div", { className: "app-header-right", children: [_jsxs("details", { className: "header-menu", children: [_jsx("summary", { className: "header-menu-trigger", children: "Stats" }), _jsxs("div", { className: "header-menu-panel stats-menu", children: [_jsxs("div", { className: "header-stat-row", children: [_jsx("span", { children: "Catalog" }), _jsx("strong", { children: status?.cards.total ?? 0 })] }), _jsxs("div", { className: "header-stat-row", children: [_jsx("span", { children: "Unique names" }), _jsx("strong", { children: status?.collection.uniqueNames ?? 0 })] }), _jsxs("div", { className: "header-stat-row", children: [_jsx("span", { children: "Owned copies" }), _jsx("strong", { children: status?.collection.ownedCopies ?? 0 })] }), _jsxs("div", { className: "header-stat-row", children: [_jsx("span", { children: "Owned rows" }), _jsx("strong", { children: status?.collection.importRowsWithCopies ?? 0 })] })] })] }), _jsxs("details", { className: "header-menu", children: [_jsxs("summary", { className: "header-menu-trigger", children: [_jsx("span", { className: `scheme-tone ${activeTheme.tone}`, "aria-hidden": "true" }), _jsx("span", { children: activeTheme.label })] }), _jsxs("div", { className: "header-menu-panel theme-menu", children: [_jsxs("div", { className: "theme-menu-group", children: [_jsx("span", { className: "theme-menu-heading", children: "Dark" }), darkThemes.map((option) => (_jsxs("button", { className: theme === option.value ? "theme-menu-item active" : "theme-menu-item", onClick: () => setTheme(option.value), type: "button", children: [_jsx("span", { className: `scheme-tone ${option.tone}`, "aria-hidden": "true" }), _jsx("span", { children: option.label }), _jsx("small", { children: option.tone })] }, option.value)))] }), _jsxs("div", { className: "theme-menu-group", children: [_jsx("span", { className: "theme-menu-heading", children: "Light" }), lightThemes.map((option) => (_jsxs("button", { className: theme === option.value ? "theme-menu-item active" : "theme-menu-item", onClick: () => setTheme(option.value), type: "button", children: [_jsx("span", { className: `scheme-tone ${option.tone}`, "aria-hidden": "true" }), _jsx("span", { children: option.label }), _jsx("small", { children: option.tone })] }, option.value)))] })] })] }), _jsx("button", { className: activeTab === "import" ? "tab-button active" : "tab-button", onClick: () => switchTab("import"), type: "button", children: "Import" })] })] }), errorMessage ? _jsx("div", { className: "banner error", children: errorMessage }) : null, importMessage ? _jsx("div", { className: "banner success", children: importMessage }) : null, status && status.cards.total === 0 ? (_jsxs("div", { className: "banner warning", children: ["No Arena catalog is loaded yet. Run ", _jsx("code", { children: "npm run db:sync" }), " from the project root, then refresh the app."] })) : null, _jsxs("main", { className: activeTab === "search" ? "app-main search-main" : "app-main", children: [activeTab === "search" ? (_jsxs("div", { className: filtersCollapsed ? "search-layout filters-collapsed" : "search-layout", children: [!filtersCollapsed ? (_jsx("aside", { className: "search-sidebar", children: _jsxs("section", { className: "panel filters-panel", children: [_jsxs("div", { className: "panel-header filters-panel-header", children: [_jsxs("button", { className: "ghost-button subtle-button cart-button header-cart-button", onClick: () => setDeckDrawerOpen(true), type: "button", children: [_jsxs("span", { className: "deck-cart-icon", "aria-hidden": "true", children: [_jsx("span", {}), _jsx("span", {})] }), _jsx("span", { className: "cart-button-label", children: selectedDeckLabel }), _jsx("span", { className: "cart-badge", children: activeDeckTotalCards })] }), _jsx("div", { className: "panel-actions", children: _jsx("button", { "aria-label": "Collapse filters", className: "ghost-button subtle-button icon-button", onClick: () => setFiltersCollapsed(true), type: "button", children: "\u2190" }) })] }), _jsxs(_Fragment, { children: [_jsxs("label", { className: "field", children: [_jsx("span", { children: "Text" }), _jsx("input", { value: searchState.q, onChange: (event) => setSearchState({ ...searchState, q: event.target.value }), placeholder: "Search name or oracle text" })] }), _jsxs("label", { className: "field", children: [_jsx("span", { children: "Format" }), _jsx("select", { value: searchState.format, onChange: (event) => setSearchState({ ...searchState, format: event.target.value }), children: FORMATS.map(([value, label]) => (_jsx("option", { value: value, children: label }, value))) })] }), _jsxs("label", { className: searchState.ownedOnly ? "inline-toggle toggle-switch active" : "inline-toggle toggle-switch", children: [_jsx("input", { className: "toggle-switch-input", checked: searchState.ownedOnly, onChange: (event) => setSearchState({ ...searchState, ownedOnly: event.target.checked }), type: "checkbox" }), _jsx("span", { className: "toggle-switch-track", "aria-hidden": "true", children: _jsx("span", { className: "toggle-switch-thumb" }) }), _jsxs("span", { className: "toggle-switch-copy", children: [_jsx("strong", { children: "Owned cards only" }), _jsx("small", { children: searchState.ownedOnly ? "Showing only your imported collection" : "Showing the full Arena catalog" })] })] }), _jsxs("div", { className: "filter-group", children: [_jsx("span", { children: "Colors" }), _jsx("div", { className: "chip-grid", children: COLORS.map((color) => (_jsx("button", { className: searchState.colors.includes(color) ? "chip active" : "chip", onClick: () => setSearchState({
-                                                                    ...searchState,
-                                                                    colors: toggleValue(searchState.colors, color)
-                                                                }), type: "button", children: color }, color))) })] }), _jsxs("div", { className: "filter-group", children: [_jsx("span", { children: "Types" }), _jsx("div", { className: "chip-grid", children: CARD_TYPES.map((type) => (_jsx("button", { className: searchState.types.includes(type) ? "chip active" : "chip", onClick: () => setSearchState({
-                                                                    ...searchState,
-                                                                    types: toggleValue(searchState.types, type)
-                                                                }), type: "button", children: type }, type))) })] }), _jsxs("label", { className: "field", children: [_jsx("span", { children: "Subtype / tribe" }), _jsx("input", { placeholder: "Kithkin, Shrine, Angel", value: searchState.subtypes, onChange: (event) => setSearchState({
-                                                                ...searchState,
-                                                                subtypes: event.target.value
-                                                            }) })] }), _jsxs("div", { className: "filter-group", children: [_jsx("span", { children: "Rarity" }), _jsx("div", { className: "chip-grid", children: RARITIES.map((rarity) => (_jsx("button", { className: searchState.rarity.includes(rarity) ? "chip active" : "chip", onClick: () => setSearchState({
-                                                                    ...searchState,
-                                                                    rarity: toggleValue(searchState.rarity, rarity)
-                                                                }), type: "button", children: rarity }, rarity))) })] }), _jsxs("div", { className: "filter-group", children: [_jsxs("div", { className: "filter-heading", children: [_jsx("span", { children: "Mechanics" }), _jsx("button", { className: "ghost-button subtle-button", onClick: () => setGlossaryOpen(true), type: "button", children: "Glossary" })] }), selectedMechanics.length ? (_jsxs("div", { className: "mechanic-section", children: [_jsx("span", { className: "mechanic-section-title", children: "Selected" }), _jsx("div", { className: "chip-grid", children: selectedMechanics.map((mechanic) => (_jsx("button", { className: "chip active", title: mechanic.definition, onClick: () => toggleMechanic(mechanic.slug), type: "button", children: mechanic.label }, `selected-${mechanic.slug}`))) })] })) : null, sidebarFavorites.length ? (_jsxs("div", { className: "mechanic-section", children: [_jsx("span", { className: "mechanic-section-title", children: "Pinned" }), _jsx("div", { className: "chip-grid", children: sidebarFavorites.map((mechanic) => (_jsx("button", { className: searchState.mechanics.includes(mechanic.slug) ? "chip active" : "chip", title: mechanic.definition, onClick: () => toggleMechanic(mechanic.slug), type: "button", children: mechanic.label }, `favorite-${mechanic.slug}`))) })] })) : null, sidebarDerivedGroups.map((section) => (_jsxs("div", { className: "mechanic-section", children: [_jsx("span", { className: "mechanic-section-title", children: section.label }), _jsx("div", { className: "chip-grid mechanic-grid compact-grid", children: section.items.map((mechanic) => (_jsx("button", { className: searchState.mechanics.includes(mechanic.slug) ? "chip active" : "chip", title: mechanic.definition, onClick: () => toggleMechanic(mechanic.slug), type: "button", children: mechanic.label }, mechanic.slug))) })] }, `sidebar-${section.id}`)))] }), _jsxs("div", { className: "mana-range", children: [_jsxs("label", { className: "field", children: [_jsx("span", { children: "Mana value min" }), _jsx("input", { inputMode: "numeric", value: searchState.manaValueMin, onChange: (event) => setSearchState({ ...searchState, manaValueMin: event.target.value }) })] }), _jsxs("label", { className: "field", children: [_jsx("span", { children: "Mana value max" }), _jsx("input", { inputMode: "numeric", value: searchState.manaValueMax, onChange: (event) => setSearchState({ ...searchState, manaValueMax: event.target.value }) })] })] }), _jsx("button", { className: "ghost-button subtle-button filters-clear", onClick: () => setSearchState(defaultSearch), type: "button", children: "Clear filters" })] })] }) })) : (_jsx("button", { "aria-label": "Expand filters", className: "ghost-button subtle-button search-expand-fab", onClick: () => setFiltersCollapsed(false), type: "button", children: "\u2192" })), _jsxs("section", { className: "panel results-panel", children: [_jsxs("div", { className: "panel-header", children: [_jsxs("div", { className: "results-header-main", children: [_jsx("h2", { children: "Search Results" }), _jsx("span", { children: searchLoading
+                                ].map(([tab, label]) => (_jsx("button", { className: activeTab === tab ? "tab-button active" : "tab-button", onClick: () => switchTab(tab), type: "button", children: label }, tab))) })] }), _jsxs("div", { className: "app-header-right", children: [_jsxs("details", { className: "header-menu", children: [_jsx("summary", { className: "header-menu-trigger", children: "Catalog" }), _jsxs("div", { className: "header-menu-panel stats-menu", children: [_jsxs("div", { className: "header-stat-row", children: [_jsx("span", { children: "Catalog" }), _jsx("strong", { children: status?.cards.total ?? 0 })] }), _jsxs("div", { className: "header-stat-row", children: [_jsx("span", { children: "Unique names" }), _jsx("strong", { children: status?.collection.uniqueNames ?? 0 })] }), _jsxs("div", { className: "header-stat-row", children: [_jsx("span", { children: "Owned copies" }), _jsx("strong", { children: status?.collection.ownedCopies ?? 0 })] }), _jsxs("div", { className: "header-stat-row", children: [_jsx("span", { children: "Owned rows" }), _jsx("strong", { children: status?.collection.importRowsWithCopies ?? 0 })] })] })] }), _jsxs("details", { className: "header-menu", children: [_jsxs("summary", { className: "header-menu-trigger", children: [_jsx("span", { className: `scheme-tone ${activeTheme.tone}`, "aria-hidden": "true" }), _jsx("span", { children: activeTheme.label })] }), _jsxs("div", { className: "header-menu-panel theme-menu", children: [_jsxs("div", { className: "theme-menu-group", children: [_jsx("span", { className: "theme-menu-heading", children: "Dark" }), darkThemes.map((option) => (_jsxs("button", { className: theme === option.value ? "theme-menu-item active" : "theme-menu-item", onClick: () => setTheme(option.value), type: "button", children: [_jsx("span", { className: `scheme-tone ${option.tone}`, "aria-hidden": "true" }), _jsx("span", { children: option.label }), _jsx("small", { children: option.tone })] }, option.value)))] }), _jsxs("div", { className: "theme-menu-group", children: [_jsx("span", { className: "theme-menu-heading", children: "Light" }), lightThemes.map((option) => (_jsxs("button", { className: theme === option.value ? "theme-menu-item active" : "theme-menu-item", onClick: () => setTheme(option.value), type: "button", children: [_jsx("span", { className: `scheme-tone ${option.tone}`, "aria-hidden": "true" }), _jsx("span", { children: option.label }), _jsx("small", { children: option.tone })] }, option.value)))] })] })] }), _jsx("button", { className: activeTab === "import" ? "tab-button active" : "tab-button", onClick: () => switchTab("import"), type: "button", children: "Import" })] })] }), errorMessage ? _jsx("div", { className: "banner error", children: errorMessage }) : null, importMessage ? _jsx("div", { className: "banner success", children: importMessage }) : null, status && status.cards.total === 0 ? (_jsxs("div", { className: "banner warning", children: ["No Arena catalog is loaded yet. Run ", _jsx("code", { children: "npm run db:sync" }), " from the project root, then refresh the app."] })) : null, _jsxs("main", { className: activeTab === "search" || activeTab === "stats" ? "app-main search-main" : "app-main", children: [activeTab === "search" ? (_jsxs("div", { className: filtersCollapsed ? "search-layout filters-collapsed" : "search-layout", children: [!filtersCollapsed ? (_jsx("aside", { className: "search-sidebar", children: _jsxs("section", { className: "panel filters-panel", children: [_jsxs("div", { className: "panel-header filters-panel-header", children: [_jsxs("button", { className: "ghost-button subtle-button cart-button header-cart-button", onClick: () => setDeckDrawerOpen(true), type: "button", children: [_jsxs("span", { className: "deck-cart-icon", "aria-hidden": "true", children: [_jsx("span", {}), _jsx("span", {})] }), _jsx("span", { className: "cart-button-label", children: selectedDeckLabel }), _jsx("span", { className: "cart-badge", children: activeDeckTotalCards })] }), _jsx("div", { className: "panel-actions", children: _jsx("button", { "aria-label": "Collapse filters", className: "ghost-button subtle-button icon-button", onClick: () => setFiltersCollapsed(true), type: "button", children: "\u2190" }) })] }), renderSharedFilters(searchState, updateSearchFilters, {
+                                            ownedLabel: "Owned cards only",
+                                            ownedHintOn: "Showing only your imported collection",
+                                            ownedHintOff: "Showing the full Arena catalog",
+                                            onClear: () => updateSearchFilters(() => defaultSearch),
+                                            selectedMechanics: selectedSearchMechanics
+                                        })] }) })) : (_jsx("button", { "aria-label": "Expand filters", className: "ghost-button subtle-button search-expand-fab", onClick: () => setFiltersCollapsed(false), type: "button", children: "\u2192" })), _jsxs("section", { className: "panel results-panel", children: [_jsxs("div", { className: "panel-header", children: [_jsxs("div", { className: "results-header-main", children: [_jsx("h2", { children: "Search Results" }), _jsx("span", { children: searchLoading
                                                             ? "Searching..."
-                                                            : `Showing ${Math.min(visibleResultsCount, cards.length)} of ${cardsTotal} matches` })] }), _jsx("div", { className: "view-toggle", children: ["grid", "list", "table"].map((mode) => (_jsx("button", { className: viewMode === mode ? "view-button active" : "view-button", onClick: () => setViewMode(mode), type: "button", children: mode.charAt(0).toUpperCase() + mode.slice(1) }, mode))) })] }), viewMode === "grid" ? (_jsx("div", { className: "results-grid", children: visibleCards.map((card) => (_jsxs("article", { className: "card-tile", children: [_jsx(ColorStrip, { colors: getCardAccentColors(card) }), _jsxs("div", { className: "card-tile-body", children: [_jsxs("div", { className: "card-tile-header", children: [_jsxs("div", { children: [_jsx("h3", { children: card.name }), _jsx("p", { children: card.typeLine })] }), _jsxs("div", { className: "card-corner", children: [_jsx(CardCornerVisual, { card: card }), _jsx(OwnershipDots, { card: card })] })] }), _jsx("p", { className: "rules-text", children: _jsx(RenderOraclePreview, { text: card.oracleText }) }), _jsx("div", { className: "tag-row", children: card.mechanics.slice(0, 6).map((mechanic) => (_jsx("span", { className: `tag ${mechanic.type}`, title: mechanic.definition, children: mechanic.label }, mechanic.slug))) }), _jsx("div", { className: "card-meta", children: _jsx(CardMetaSummary, { card: card }) }), _jsx("div", { className: "card-actions", children: renderActions(card) })] })] }, card.id))) })) : null, viewMode === "list" ? (_jsx("div", { className: "results-list", children: visibleCards.map((card) => (_jsxs("article", { className: "result-row", children: [_jsx(ColorStrip, { colors: getCardAccentColors(card) }), _jsxs("div", { className: "result-row-body", children: [_jsxs("div", { className: "result-row-main", children: [_jsxs("div", { className: "result-row-title", children: [_jsx("strong", { children: card.name }), _jsx("span", { children: card.typeLine })] }), _jsx("div", { className: "result-row-oracle", children: _jsx(RenderOraclePreview, { className: "oracle-preview", text: card.oracleText }) }), _jsxs("div", { className: "result-row-footer", children: [_jsx("div", { className: "card-meta", children: _jsx(CardMetaSummary, { card: card }) }), _jsx("div", { className: "list-mechanics", children: getMechanicSummary(card, 4) || "No indexed mechanics" })] })] }), _jsxs("div", { className: "result-row-side", children: [_jsx(CardCornerVisual, { card: card, compactLand: true }), _jsx(OwnershipDots, { card: card }), _jsx("div", { className: "card-actions compact-actions", children: renderActions(card) })] })] })] }, card.id))) })) : null, viewMode === "table" ? (_jsx("div", { className: "results-table-wrap", children: _jsxs("table", { className: "results-table", children: [_jsx("thead", { children: _jsxs("tr", { children: [_jsx("th", { children: _jsx("button", { className: "table-sort", onClick: () => toggleTableSort("name"), type: "button", children: "Name" }) }), _jsx("th", { children: _jsx("button", { className: "table-sort table-sort-center", onClick: () => toggleTableSort("manaCost"), type: "button", children: "Cost" }) }), _jsx("th", { children: _jsx("button", { className: "table-sort table-sort-center", onClick: () => toggleTableSort("manaValue"), type: "button", children: "MV" }) }), _jsx("th", { children: _jsx("button", { className: "table-sort", onClick: () => toggleTableSort("typeLine"), type: "button", children: "Type" }) }), _jsx("th", { children: _jsx("button", { className: "table-sort table-sort-center", onClick: () => toggleTableSort("ownedCount"), type: "button", children: "Playable" }) }), _jsx("th", { children: _jsx("button", { className: "table-sort table-sort-center", onClick: () => toggleTableSort("rawOwnedCount"), type: "button", children: "Raw" }) }), _jsx("th", { children: _jsx("button", { className: "table-sort", onClick: () => toggleTableSort("set"), type: "button", children: "Set" }) }), _jsx("th", { children: _jsx("button", { className: "table-sort", onClick: () => toggleTableSort("rarity"), type: "button", children: "Rarity" }) }), _jsx("th", { children: _jsx("button", { className: "table-sort", onClick: () => toggleTableSort("mechanics"), type: "button", children: "Mechanics" }) }), _jsx("th", { className: "table-head-center", children: "Actions" })] }) }), _jsx("tbody", { children: visibleSortedCards.map((card) => (_jsxs("tr", { children: [_jsx("td", { children: _jsxs("button", { className: "table-card-trigger table-name table-name-accent", onClick: () => void openCardDetail(card), type: "button", children: [_jsx(VerticalColorStrip, { colors: getCardAccentColors(card) }), _jsx("strong", { children: card.name }), _jsx("span", { children: card.typeLine })] }) }), _jsx("td", { className: "table-cell-center table-cell-graphic", children: _jsx(CardCornerVisual, { card: card, compactLand: true }) }), _jsx("td", { className: "table-cell-center", children: card.manaValue }), _jsx("td", { children: card.typeLine }), _jsx("td", { className: "table-cell-center", children: card.deckBuildingLimit === null ? "∞" : card.ownedCount }), _jsx("td", { className: "table-cell-center", children: card.rawOwnedCount }), _jsx("td", { children: card.preferredSetCode ?? "SET" }), _jsx("td", { children: card.rarity }), _jsx("td", { children: getMechanicSummary(card, 3) || "None" }), _jsx("td", { className: "table-cell-center table-cell-actions", children: _jsx("div", { className: "card-actions table-actions", children: renderActions(card) }) })] }, `table-${card.id}`))) })] }) })) : null, !searchLoading && cards.length > 0 ? (_jsxs("div", { className: "results-footer", children: [_jsxs("span", { className: "results-summary", children: ["Loaded ", cards.length.toLocaleString(), " result", cards.length === 1 ? "" : "s", cardsTotal > cards.length ? ` of ${cardsTotal.toLocaleString()} total` : ""] }), _jsxs("div", { className: "results-actions", children: [visibleResultsCount < cards.length ? (_jsxs("button", { className: "ghost-button subtle-button", onClick: () => setVisibleResultsCount((current) => Math.min(current + VISIBLE_RESULTS_STEP, cards.length)), type: "button", children: ["Show ", Math.min(VISIBLE_RESULTS_STEP, cards.length - visibleResultsCount), " more"] })) : null, visibleResultsCount < cards.length ? (_jsx("button", { className: "ghost-button subtle-button", onClick: () => setVisibleResultsCount(cards.length), type: "button", children: "Show all loaded" })) : null] })] })) : null] })] })) : null, activeTab === "decks" ? (_jsxs("div", { className: "workspace-grid", children: [_jsxs("section", { className: "panel deck-list-panel", children: [_jsxs("div", { className: "panel-header", children: [_jsx("h2", { children: "Decks" }), _jsxs("span", { children: [deckList.length, " saved"] })] }), _jsxs("div", { className: "deck-creator", children: [_jsxs("label", { className: "field", children: [_jsx("span", { children: "Name" }), _jsx("input", { value: deckName, onChange: (event) => setDeckName(event.target.value) })] }), _jsxs("label", { className: "field", children: [_jsx("span", { children: "Format" }), _jsx("select", { value: deckFormat, onChange: (event) => setDeckFormat(event.target.value), children: FORMATS.map(([value, label]) => (_jsx("option", { value: value, children: label }, value))) })] }), _jsx("button", { className: "primary-button", onClick: handleCreateDeck, type: "button", children: "Create deck" })] }), _jsx("div", { className: "deck-list", children: deckList.map((deck) => (_jsxs("button", { className: activeDeck?.id === deck.id ? "deck-list-item active" : "deck-list-item", onClick: () => handleSelectDeck(deck.id), type: "button", children: [_jsx("strong", { children: deck.name }), _jsx("span", { children: FORMATS.find(([value]) => value === deck.format)?.[1] ?? deck.format }), _jsxs("small", { children: [deck.totalCards, " cards"] })] }, deck.id))) })] }), _jsx("section", { className: "panel deck-detail-panel", children: activeDeck ? (_jsxs(_Fragment, { children: [_jsxs("div", { className: "panel-header", children: [_jsxs("div", { children: [_jsx("h2", { children: activeDeck.name }), _jsx("span", { children: FORMATS.find(([value]) => value === activeDeck.format)?.[1] })] }), _jsx("button", { className: "ghost-button", onClick: () => void saveDeck(activeDeck), type: "button", children: "Save deck" })] }), _jsxs("label", { className: "field", children: [_jsx("span", { children: "Deck name" }), _jsx("input", { value: activeDeck.name, onChange: (event) => setActiveDeck({
+                                                            : `Showing ${Math.min(visibleResultsCount, cards.length)} of ${cardsTotal} matches` })] }), _jsx("div", { className: "view-toggle", children: ["grid", "list", "table"].map((mode) => (_jsx("button", { className: viewMode === mode ? "view-button active" : "view-button", onClick: () => setViewMode(mode), type: "button", children: mode.charAt(0).toUpperCase() + mode.slice(1) }, mode))) })] }), searchState.drilldownKind && searchState.drilldownLabel ? (_jsxs("div", { className: "stats-drilldown-banner", children: [_jsxs("div", { children: [_jsx("strong", { children: "Metric filter active" }), _jsxs("span", { children: ["Showing cards from the current filter set plus ", searchState.drilldownLabel, "."] })] }), _jsx("button", { className: "ghost-button subtle-button", onClick: () => setSearchState((current) => clearDrilldownState(current)), type: "button", children: "Clear metric filter" })] })) : null, viewMode === "grid" ? (_jsx("div", { className: "results-grid", children: visibleCards.map((card) => (_jsxs("article", { className: "card-tile", children: [_jsx(ColorStrip, { colors: getCardAccentColors(card) }), _jsxs("div", { className: "card-tile-body", children: [_jsxs("div", { className: "card-tile-header", children: [_jsxs("div", { children: [_jsx("h3", { children: card.name }), _jsx("p", { children: card.typeLine })] }), _jsxs("div", { className: "card-corner", children: [_jsx(CardCornerVisual, { card: card }), _jsx(OwnershipDots, { card: card })] })] }), _jsx("p", { className: "rules-text", children: _jsx(RenderOraclePreview, { text: card.oracleText }) }), _jsx("div", { className: "tag-row", children: card.mechanics.slice(0, 6).map((mechanic) => (_jsx("span", { className: `tag ${mechanic.type}`, title: mechanic.definition, children: mechanic.label }, mechanic.slug))) }), _jsx("div", { className: "card-meta", children: _jsx(CardMetaSummary, { card: card }) }), _jsx("div", { className: "card-actions", children: renderActions(card) })] })] }, card.id))) })) : null, viewMode === "list" ? (_jsx("div", { className: "results-list", children: visibleCards.map((card) => (_jsxs("article", { className: "result-row", children: [_jsx(ColorStrip, { colors: getCardAccentColors(card) }), _jsxs("div", { className: "result-row-body", children: [_jsxs("div", { className: "result-row-main", children: [_jsxs("div", { className: "result-row-title", children: [_jsx("strong", { children: card.name }), _jsx("span", { children: card.typeLine })] }), _jsx("div", { className: "result-row-oracle", children: _jsx(RenderOraclePreview, { className: "oracle-preview", text: card.oracleText }) }), _jsxs("div", { className: "result-row-footer", children: [_jsx("div", { className: "card-meta", children: _jsx(CardMetaSummary, { card: card }) }), _jsx("div", { className: "list-mechanics", children: getMechanicSummary(card, 4) || "No indexed mechanics" })] })] }), _jsxs("div", { className: "result-row-side", children: [_jsx(CardCornerVisual, { card: card, compactLand: true }), _jsx(OwnershipDots, { card: card }), _jsx("div", { className: "card-actions compact-actions", children: renderActions(card) })] })] })] }, card.id))) })) : null, viewMode === "table" ? (_jsx("div", { className: "results-table-wrap", children: _jsxs("table", { className: "results-table", children: [_jsx("thead", { children: _jsxs("tr", { children: [_jsx("th", { children: _jsx("button", { className: "table-sort", onClick: () => toggleTableSort("name"), type: "button", children: "Name" }) }), _jsx("th", { children: _jsx("button", { className: "table-sort table-sort-center", onClick: () => toggleTableSort("manaCost"), type: "button", children: "Cost" }) }), _jsx("th", { children: _jsx("button", { className: "table-sort table-sort-center", onClick: () => toggleTableSort("manaValue"), type: "button", children: "MV" }) }), _jsx("th", { children: _jsx("button", { className: "table-sort", onClick: () => toggleTableSort("typeLine"), type: "button", children: "Type" }) }), _jsx("th", { children: _jsx("button", { className: "table-sort table-sort-center", onClick: () => toggleTableSort("ownedCount"), type: "button", children: "Playable" }) }), _jsx("th", { children: _jsx("button", { className: "table-sort table-sort-center", onClick: () => toggleTableSort("rawOwnedCount"), type: "button", children: "Raw" }) }), _jsx("th", { children: _jsx("button", { className: "table-sort", onClick: () => toggleTableSort("set"), type: "button", children: "Set" }) }), _jsx("th", { children: _jsx("button", { className: "table-sort", onClick: () => toggleTableSort("rarity"), type: "button", children: "Rarity" }) }), _jsx("th", { children: _jsx("button", { className: "table-sort", onClick: () => toggleTableSort("mechanics"), type: "button", children: "Mechanics" }) }), _jsx("th", { className: "table-head-center", children: "Actions" })] }) }), _jsx("tbody", { children: visibleSortedCards.map((card) => (_jsxs("tr", { children: [_jsx("td", { children: _jsxs("button", { className: "table-card-trigger table-name table-name-accent", onClick: () => void openCardDetail(card), type: "button", children: [_jsx(VerticalColorStrip, { colors: getCardAccentColors(card) }), _jsx("strong", { children: card.name }), _jsx("span", { children: card.typeLine })] }) }), _jsx("td", { className: "table-cell-center table-cell-graphic", children: _jsx(CardCornerVisual, { card: card, compactLand: true }) }), _jsx("td", { className: "table-cell-center", children: card.manaValue }), _jsx("td", { children: card.typeLine }), _jsx("td", { className: "table-cell-center", children: card.deckBuildingLimit === null ? "∞" : card.ownedCount }), _jsx("td", { className: "table-cell-center", children: card.rawOwnedCount }), _jsx("td", { children: card.preferredSetCode ?? "SET" }), _jsx("td", { children: card.rarity }), _jsx("td", { children: getMechanicSummary(card, 3) || "None" }), _jsx("td", { className: "table-cell-center table-cell-actions", children: _jsx("div", { className: "card-actions table-actions", children: renderActions(card) }) })] }, `table-${card.id}`))) })] }) })) : null, !searchLoading && cards.length > 0 ? (_jsxs("div", { className: "results-footer", children: [_jsxs("span", { className: "results-summary", children: ["Loaded ", cards.length.toLocaleString(), " result", cards.length === 1 ? "" : "s", cardsTotal > cards.length ? ` of ${cardsTotal.toLocaleString()} total` : ""] }), _jsxs("div", { className: "results-actions", children: [visibleResultsCount < cards.length ? (_jsxs("button", { className: "ghost-button subtle-button", onClick: () => setVisibleResultsCount((current) => Math.min(current + VISIBLE_RESULTS_STEP, cards.length)), type: "button", children: ["Show ", Math.min(VISIBLE_RESULTS_STEP, cards.length - visibleResultsCount), " more"] })) : null, visibleResultsCount < cards.length ? (_jsx("button", { className: "ghost-button subtle-button", onClick: () => setVisibleResultsCount(cards.length), type: "button", children: "Show all loaded" })) : null] })] })) : null] })] })) : null, activeTab === "stats" ? (_jsxs("div", { className: "search-layout stats-layout", children: [_jsx("aside", { className: "search-sidebar", children: _jsxs("section", { className: "panel filters-panel", children: [_jsx("div", { className: "panel-header filters-panel-header", children: _jsxs("div", { children: [_jsx("h2", { children: "Stats Filters" }), _jsx("span", { children: "Reuse the same card filters, then aggregate over the matching set." })] }) }), renderSharedFilters(statsState, updateStatsFilters, {
+                                            ownedLabel: statsState.ownedOnly ? "Owned collection" : "Full catalog",
+                                            ownedHintOn: "Playable copies drive the dashboard totals",
+                                            ownedHintOff: "Counts include unowned Arena cards that match the filters",
+                                            onClear: () => updateStatsFilters(() => defaultStatsFilters),
+                                            selectedMechanics: selectedStatsMechanics
+                                        })] }) }), _jsx("section", { className: "stats-dashboard", children: _jsxs("section", { className: "panel stats-hero-panel", children: [_jsx("div", { className: "panel-header", children: _jsxs("div", { children: [_jsx("h2", { children: statsState.ownedOnly ? "Owned collection stats" : "Full catalog stats" }), _jsx("span", { children: statsLoading
+                                                            ? "Calculating stats..."
+                                                            : "Dashboard metrics are computed directly from the filtered catalog." })] }) }), statsLoading ? (_jsx("div", { className: "stats-empty-message", children: "Calculating stats..." })) : !cardStats || cardStats.summary.matchingTitles === 0 ? (_jsx("div", { className: "stats-empty-message", children: "No cards match the current filters." })) : (_jsxs(_Fragment, { children: [_jsx("div", { className: "snapshot-grid stats-summary-grid", children: statsSummaryCards.map((card) => (_jsxs("div", { className: "stat-card summary-drilldown-card", children: [_jsx("span", { children: card.label }), _jsx("strong", { children: card.value.toLocaleString() }), _jsx("button", { className: "ghost-button subtle-button summary-drilldown-button", onClick: () => openStatsSearchView(), type: "button", children: "View cards" })] }, card.label))) }), _jsxs("div", { className: "stats-breakdown-grid", children: [renderStatsBreakdown("Color Breakdown", cardStats.breakdowns.colors, "color", statsState.ownedOnly, "No colors in the current result set."), renderStatsBreakdown("Mana Value Breakdown", cardStats.breakdowns.manaValues, "manaValue", statsState.ownedOnly, "No mana values available."), renderStatsBreakdown("Type Breakdown", cardStats.breakdowns.types, "type", statsState.ownedOnly, "No types in the current result set."), renderStatsBreakdown("Rarity Breakdown", cardStats.breakdowns.rarities, "rarity", statsState.ownedOnly, "No rarity data available.")] }), _jsxs("div", { className: "stats-breakdown-stack", children: [renderStatsBreakdown("Set Breakdown", cardStats.breakdowns.sets, "set", statsState.ownedOnly, "No sets in the current result set."), renderStatsBreakdown("Mechanic Breakdown", cardStats.breakdowns.mechanics, "mechanic", statsState.ownedOnly, "No mechanics in the current result set.")] })] }))] }) })] })) : null, activeTab === "decks" ? (_jsxs("div", { className: "workspace-grid", children: [_jsxs("section", { className: "panel deck-list-panel", children: [_jsxs("div", { className: "panel-header", children: [_jsx("h2", { children: "Decks" }), _jsxs("span", { children: [deckList.length, " saved"] })] }), _jsxs("div", { className: "deck-creator", children: [_jsxs("label", { className: "field", children: [_jsx("span", { children: "Name" }), _jsx("input", { value: deckName, onChange: (event) => setDeckName(event.target.value) })] }), _jsxs("label", { className: "field", children: [_jsx("span", { children: "Format" }), _jsx("select", { value: deckFormat, onChange: (event) => setDeckFormat(event.target.value), children: FORMATS.map(([value, label]) => (_jsx("option", { value: value, children: label }, value))) })] }), _jsx("button", { className: "primary-button", onClick: handleCreateDeck, type: "button", children: "Create deck" })] }), _jsx("div", { className: "deck-list", children: deckList.map((deck) => (_jsxs("button", { className: activeDeck?.id === deck.id ? "deck-list-item active" : "deck-list-item", onClick: () => handleSelectDeck(deck.id), type: "button", children: [_jsx("strong", { children: deck.name }), _jsx("span", { children: FORMATS.find(([value]) => value === deck.format)?.[1] ?? deck.format }), _jsxs("small", { children: [deck.totalCards, " cards"] })] }, deck.id))) })] }), _jsx("section", { className: "panel deck-detail-panel", children: activeDeck ? (_jsxs(_Fragment, { children: [_jsxs("div", { className: "panel-header", children: [_jsxs("div", { children: [_jsx("h2", { children: activeDeck.name }), _jsx("span", { children: FORMATS.find(([value]) => value === activeDeck.format)?.[1] })] }), _jsx("button", { className: "ghost-button", onClick: () => void saveDeck(activeDeck), type: "button", children: "Save deck" })] }), _jsxs("label", { className: "field", children: [_jsx("span", { children: "Deck name" }), _jsx("input", { value: activeDeck.name, onChange: (event) => setActiveDeck({
                                                         ...activeDeck,
                                                         name: event.target.value
                                                     }) })] }), _jsxs("label", { className: "field", children: [_jsx("span", { children: "Notes" }), _jsx("textarea", { rows: 3, value: activeDeck.notes, onChange: (event) => setActiveDeck({
@@ -998,9 +1262,26 @@ function App() {
                                                                         setExportText(arenaExport.text);
                                                                     }, type: "button", children: "Refresh export" })] }), validation?.ownershipGaps.length ? (_jsx("ul", { className: "issue-list", children: validation.ownershipGaps.map((gap) => (_jsxs("li", { children: [gap.name, ": need ", gap.needed, ", own ", gap.owned, ", missing ", gap.missing] }, gap.cardId))) })) : (_jsx("p", { className: "empty-state", children: "No ownership gaps for the current list." }))] })] }), _jsxs("div", { className: "subpanel export-panel", children: [_jsx("div", { className: "panel-header", children: _jsx("h3", { children: "Arena Export" }) }), _jsx("textarea", { readOnly: true, rows: 12, value: exportText })] })] })) : (_jsx("p", { className: "empty-state", children: "Create a deck to start building." })) })] })) : null, activeTab === "import" ? (_jsxs("div", { className: "workspace-grid import-workspace", children: [_jsxs("section", { className: "panel import-panel snapshot-panel", children: [_jsxs("div", { className: "panel-header", children: [_jsx("h2", { children: "Current Snapshot" }), _jsx("span", { children: "Collection status" })] }), _jsxs("div", { className: "snapshot-grid", children: [_jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "Stored entries" }), _jsx("strong", { children: status?.collection.ownedEntries ?? 0 })] }), _jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "Unique names" }), _jsx("strong", { children: status?.collection.uniqueNames ?? 0 })] }), _jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "Owned copies" }), _jsx("strong", { children: status?.collection.ownedCopies ?? 0 })] }), _jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "Owned rows" }), _jsx("strong", { children: status?.collection.importRowsWithCopies ?? 0 })] }), _jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "Unresolved rows" }), _jsx("strong", { children: status?.collection.unresolvedEntries ?? 0 })] }), _jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "Imported at" }), _jsx("strong", { children: formatDateTime(status?.collection.importedAt ?? null) })] })] })] }), _jsxs("div", { className: "import-stack", children: [_jsxs("section", { className: "panel import-panel", children: [_jsxs("div", { className: "panel-header", children: [_jsx("h2", { children: "Untapped Companion" }), _jsx("span", { children: "Safe bridge import" })] }), _jsxs("p", { className: "hero-copy", children: ["Capture a local ", _jsx("code", { children: "mtga.collection" }), " JSON dump from Untapped Companion, preview it here, then replace your current collection snapshot."] }), _jsxs("div", { className: "helper-toolbar", children: [_jsx("button", { className: "primary-button", disabled: untappedHelperLoading, onClick: handleStartUntappedGuide, type: "button", children: untappedHelperLoading ? "Starting..." : "Start guided capture" }), _jsx("button", { className: "ghost-button", onClick: handleCopyUntappedSnippet, type: "button", children: "Copy snippet" }), _jsx("button", { className: "ghost-button", disabled: !untappedHelperStatus?.latestCapture || untappedPreviewLoading, onClick: handlePreviewLatestUntappedCapture, type: "button", children: "Preview latest download" }), _jsx("button", { className: "ghost-button", disabled: untappedHelperLoading || !untappedHelperStatus?.showDevTools, onClick: handleStopUntappedGuide, type: "button", children: "Stop guided capture" })] }), _jsx("p", { className: "helper-note", children: "Guided mode enables Untapped DevTools, watches your Downloads folder, and previews the next capture automatically after the JSON download finishes." }), untappedHelperStatus ? (_jsxs("div", { className: "subpanel helper-status-panel", children: [_jsxs("div", { className: "panel-header", children: [_jsx("h3", { children: "Local helper status" }), _jsx("span", { children: untappedGuideActive ? "Watching for new captures" : "Idle" })] }), _jsxs("div", { className: "snapshot-grid helper-status-grid", children: [_jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "DevTools" }), _jsx("strong", { children: untappedHelperStatus.showDevTools ? "Enabled" : "Disabled" })] }), _jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "Helper" }), _jsx("strong", { children: untappedHelperStatus.available ? "Ready" : "Unavailable" })] }), _jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "Latest capture" }), _jsx("strong", { children: untappedHelperStatus.latestCapture ? untappedHelperStatus.latestCapture.filename : "None yet" })] }), _jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "Updated" }), _jsx("strong", { children: untappedHelperStatus.latestCapture
                                                                             ? formatDateTime(untappedHelperStatus.latestCapture.modifiedAt)
-                                                                            : "Waiting" })] })] }), _jsxs("div", { className: "helper-path-list", children: [_jsxs("p", { children: [_jsx("strong", { children: "Downloads:" }), " ", _jsx("code", { children: untappedHelperStatus.downloadsPath })] }), _jsxs("p", { children: [_jsx("strong", { children: "Config:" }), " ", _jsx("code", { children: untappedHelperStatus.configPath })] }), untappedHelperStatus.latestCapture ? (_jsxs("p", { children: [_jsx("strong", { children: "Latest file:" }), " ", _jsx("code", { children: untappedHelperStatus.latestCapture.path }), " (", formatFileSize(untappedHelperStatus.latestCapture.size), ")"] })) : null] })] })) : null, _jsxs("ol", { className: "import-steps", children: [_jsx("li", { children: "Open Untapped Companion and MTGA Deck Builder." }), _jsx("li", { children: "Open Untapped DevTools and run this console snippet." }), _jsx("li", { children: "Wait for the download or upload the JSON manually if the watcher misses it." })] }), _jsx("pre", { className: "capture-snippet", children: _jsx("code", { children: untappedHelperStatus?.snippet ?? UNTAPPED_CAPTURE_SNIPPET }) }), _jsxs("label", { className: "upload-drop", children: [_jsx("input", { accept: ".json,application/json", onChange: handleUntappedPreview, type: "file" }), _jsx("span", { children: untappedFile ? untappedFile.name : "Choose your Untapped collection JSON" }), _jsxs("small", { children: ["Raw ", _jsx("code", { children: "grpId -> quantity" }), " map exported from the Untapped renderer."] })] }), untappedPreviewLoading ? (_jsx("p", { className: "empty-state", children: "Previewing Untapped collection..." })) : null, untappedPreview ? (_jsxs("div", { className: "untapped-preview", children: [_jsxs("div", { className: "panel-header preview-header", children: [_jsxs("div", { children: [_jsx("h3", { children: "Preview" }), _jsxs("span", { children: [formatCatalogLabel(untappedPreview), untappedPreviewSource === "latest-capture" && untappedHelperStatus?.latestCapture
-                                                                                ? ` · ${untappedHelperStatus.latestCapture.filename}`
-                                                                                : ""] })] }), _jsx("button", { className: "primary-button", disabled: untappedImporting, onClick: handleConfirmUntappedImport, type: "button", children: untappedImporting ? "Importing..." : "Confirm import" })] }), _jsxs("div", { className: "snapshot-grid import-preview-grid", children: [_jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "Owned titles" }), _jsx("strong", { children: untappedPreview.ownedTitles })] }), _jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "Playable copies" }), _jsx("strong", { children: untappedPreview.ownedCopies })] }), _jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "Variant copies" }), _jsx("strong", { children: untappedPreview.rawOwnedCopies })] }), _jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "Matched grpIds" }), _jsx("strong", { children: untappedPreview.matchedGrpIds })] }), _jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "Unmatched grpIds" }), _jsx("strong", { children: untappedPreview.unmatchedGrpIds })] }), _jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "Extracted path" }), _jsx("strong", { children: untappedPreview.extractedPath })] })] }), _jsxs("div", { className: "snapshot-grid import-diff-grid", children: [_jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "Added titles" }), _jsx("strong", { children: untappedPreview.diff.addedTitles })] }), _jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "Removed titles" }), _jsx("strong", { children: untappedPreview.diff.removedTitles })] }), _jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "Changed titles" }), _jsx("strong", { children: untappedPreview.diff.changedTitles })] }), _jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "Unchanged titles" }), _jsx("strong", { children: untappedPreview.diff.unchangedTitles })] })] }), untappedPreview.unresolvedCards.length ? (_jsxs("div", { className: "subpanel import-warning-panel", children: [_jsxs("div", { className: "panel-header", children: [_jsx("h3", { children: "Unresolved local matches" }), _jsx("span", { children: untappedPreview.unresolvedCards.length })] }), _jsx("ul", { className: "issue-list", children: untappedPreview.unresolvedCards.slice(0, 6).map((entry) => (_jsxs("li", { children: [entry.name, ": ", entry.titleCount, " playable, ", entry.printCount, " variant copies"] }, entry.name))) })] })) : null, untappedPreview.unmatchedEntries.length ? (_jsxs("div", { className: "subpanel import-warning-panel", children: [_jsxs("div", { className: "panel-header", children: [_jsx("h3", { children: "Catalog misses" }), _jsx("span", { children: untappedPreview.unmatchedEntries.length })] }), _jsx("ul", { className: "issue-list", children: untappedPreview.unmatchedEntries.slice(0, 6).map((entry) => (_jsxs("li", { children: ["grpId ", entry.grpId, ": qty ", entry.quantity] }, entry.grpId))) })] })) : null] })) : null] }), _jsxs("section", { className: "panel import-panel", children: [_jsxs("div", { className: "panel-header", children: [_jsx("h2", { children: "Collection CSV" }), _jsx("span", { children: "Fallback import" })] }), _jsx("p", { className: "hero-copy", children: "Upload an MTG Arena collection export. The new file replaces the current ownership snapshot atomically." }), _jsxs("label", { className: "upload-drop", children: [_jsx("input", { accept: ".csv,text/csv", onChange: handleImport, type: "file" }), _jsx("span", { children: "Choose your Arena collection CSV" }), _jsx("small", { children: "Required columns: Id, Name, Set, Color, Rarity, Count, PrintCount" })] })] })] })] })) : null] }), glossaryOpen ? (_jsx("div", { className: "modal-shell", onClick: () => setGlossaryOpen(false), role: "presentation", children: _jsxs("div", { className: "modal-card glossary-modal", onClick: (event) => event.stopPropagation(), role: "dialog", "aria-modal": "true", "aria-label": "Mechanic glossary", children: [_jsxs("div", { className: "panel-header", children: [_jsxs("div", { children: [_jsx("h2", { children: "Mechanic Glossary" }), _jsxs("span", { children: [glossaryItems.length, " visible mechanics"] })] }), _jsx("button", { className: "ghost-button subtle-button", onClick: () => setGlossaryOpen(false), type: "button", children: "Close" })] }), _jsxs("label", { className: "field", children: [_jsx("span", { children: "Find a mechanic" }), _jsx("input", { value: glossaryQuery, onChange: (event) => setGlossaryQuery(event.target.value), placeholder: "Search names and definitions" })] }), _jsxs("div", { className: "glossary-list modal-glossary-list", children: [glossaryFavorites.length ? (_jsxs("section", { className: "glossary-group", children: [_jsx("h3", { children: "Pinned" }), glossaryFavorites.map((mechanic) => {
+                                                                            : "Waiting" })] })] }), _jsxs("div", { className: "helper-path-list", children: [_jsxs("p", { children: [_jsx("strong", { children: "Downloads:" }), " ", _jsx("code", { children: untappedHelperStatus.downloadsPath })] }), _jsxs("p", { children: [_jsx("strong", { children: "Config:" }), " ", _jsx("code", { children: untappedHelperStatus.configPath })] }), untappedHelperStatus.latestCapture ? (_jsxs("p", { children: [_jsx("strong", { children: "Latest file:" }), " ", _jsx("code", { children: untappedHelperStatus.latestCapture.path }), " (", formatFileSize(untappedHelperStatus.latestCapture.size), ")"] })) : null] })] })) : null, _jsxs("ol", { className: "import-steps", children: [_jsx("li", { children: "Open Untapped Companion and MTGA Deck Builder." }), _jsx("li", { children: "Open Untapped DevTools and run this console snippet." }), _jsx("li", { children: "Wait for the download or upload the JSON manually if the watcher misses it." })] }), _jsx("pre", { className: "capture-snippet", children: _jsx("code", { children: untappedHelperStatus?.snippet ?? UNTAPPED_CAPTURE_SNIPPET }) }), _jsxs("label", { className: "upload-drop", children: [_jsx("input", { accept: ".json,application/json", onChange: handleUntappedPreview, type: "file" }), _jsx("span", { children: untappedFile ? untappedFile.name : "Choose your Untapped collection JSON" }), _jsxs("small", { children: ["Raw ", _jsx("code", { children: "grpId -> quantity" }), " map exported from the Untapped renderer."] })] }), untappedPreviewLoading ? (_jsx("p", { className: "empty-state", children: "Previewing Untapped collection..." })) : null, untappedPreview ? (renderCollectionImportPreview(untappedPreview, {
+                                                importing: untappedImporting,
+                                                onConfirm: handleConfirmUntappedImport,
+                                                contextSuffix: untappedPreviewSource === "latest-capture" && untappedHelperStatus?.latestCapture
+                                                    ? untappedHelperStatus.latestCapture.filename
+                                                    : undefined
+                                            })) : null] }), _jsxs("section", { className: "panel import-panel", children: [_jsxs("div", { className: "panel-header", children: [_jsx("h2", { children: "Collector Snapshot" }), _jsx("span", { children: "One-click local capture" })] }), _jsx("p", { className: "hero-copy", children: "Refresh directly from the running MTGA client, preview the captured snapshot here, then replace your current collection." }), _jsxs("div", { className: "helper-toolbar", children: [_jsx("button", { className: "primary-button", disabled: collectorHelperLoading || collectorSnapshotImporting, onClick: handleCaptureLatestCollectorSnapshot, type: "button", children: collectorHelperLoading ? "Refreshing..." : "Refresh From MTGA" }), _jsx("button", { className: "ghost-button", disabled: !collectorHelperStatus?.latestCapture || collectorHelperLoading || collectorSnapshotImporting, onClick: handlePreviewLatestCollectorSnapshot, type: "button", children: "Preview latest snapshot" })] }), _jsx("p", { className: "helper-note", children: "This uses the local signed collector host, writes a snapshot to disk, and then previews the result before import." }), _jsxs("ol", { className: "import-steps", children: [_jsx("li", { children: "Open MTG Arena and leave it running." }), _jsxs("li", { children: ["Click ", _jsx("strong", { children: "Refresh From MTGA" }), "."] }), _jsx("li", { children: "Wait for the preview to appear." }), _jsxs("li", { children: ["Check the counts, then click ", _jsx("strong", { children: "Confirm import" }), "."] })] }), collectorHelperStatus ? (_jsxs("div", { className: "subpanel helper-status-panel", children: [_jsxs("div", { className: "panel-header", children: [_jsx("h3", { children: "Local collector status" }), _jsx("span", { children: collectorHelperStatus.available ? "Ready" : "Needs attention" })] }), _jsxs("div", { className: "snapshot-grid helper-status-grid", children: [_jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "Collector" }), _jsx("strong", { children: collectorHelperStatus.available ? "Ready" : "Unavailable" })] }), _jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "MTGA" }), _jsx("strong", { children: collectorHelperStatus.mtgaRunning
+                                                                            ? `Running${collectorHelperStatus.mtgaPid ? ` · PID ${collectorHelperStatus.mtgaPid}` : ""}`
+                                                                            : "Not detected" })] }), _jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "Addon" }), _jsx("strong", { children: collectorHelperStatus.addonAvailable ? "Found" : "Missing" })] }), _jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "codesign" }), _jsx("strong", { children: collectorHelperStatus.codesignAvailable ? "Ready" : "Missing" })] }), _jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "Latest snapshot" }), _jsx("strong", { children: collectorHelperStatus.latestCapture ? collectorHelperStatus.latestCapture.filename : "None yet" })] }), _jsxs("div", { className: "stat-card dense", children: [_jsx("span", { children: "Updated" }), _jsx("strong", { children: collectorHelperStatus.latestCapture
+                                                                            ? formatDateTime(collectorHelperStatus.latestCapture.modifiedAt)
+                                                                            : "Waiting" })] })] }), _jsxs("div", { className: "helper-path-list", children: [_jsxs("p", { children: [_jsx("strong", { children: "Snapshot path:" }), " ", _jsx("code", { children: collectorHelperStatus.snapshotPath })] }), _jsxs("p", { children: [_jsx("strong", { children: "Addon path:" }), " ", _jsx("code", { children: collectorHelperStatus.addonPath })] })] })] })) : null, _jsxs("label", { className: "upload-drop", children: [_jsx("input", { accept: ".json,application/json", onChange: handleCollectorSnapshotPreview, type: "file" }), _jsx("span", { children: collectorSnapshotFile ? collectorSnapshotFile.name : "Choose your collector snapshot JSON" }), _jsxs("small", { children: ["Supports ", _jsx("code", { children: `{ snapshotVersion, collection }` }), " or a raw ", _jsx("code", { children: "grpId -> quantity" }), " map."] })] }), collectorSnapshotPreviewLoading ? (_jsx("p", { className: "empty-state", children: "Previewing collector snapshot..." })) : null, collectorSnapshotPreview
+                                                ? renderCollectionImportPreview(collectorSnapshotPreview, {
+                                                    importing: collectorSnapshotImporting,
+                                                    onConfirm: handleConfirmCollectorSnapshotImport,
+                                                    contextSuffix: collectorPreviewSource === "latest-capture" &&
+                                                        "capture" in collectorSnapshotPreview
+                                                        ? collectorSnapshotPreview.capture.filename
+                                                        : undefined
+                                                })
+                                                : null] }), _jsxs("section", { className: "panel import-panel", children: [_jsxs("div", { className: "panel-header", children: [_jsx("h2", { children: "Collection CSV" }), _jsx("span", { children: "Fallback import" })] }), _jsx("p", { className: "hero-copy", children: "Upload an MTG Arena collection export. The new file replaces the current ownership snapshot atomically." }), _jsxs("label", { className: "upload-drop", children: [_jsx("input", { accept: ".csv,text/csv", onChange: handleImport, type: "file" }), _jsx("span", { children: "Choose your Arena collection CSV" }), _jsx("small", { children: "Required columns: Id, Name, Set, Color, Rarity, Count, PrintCount" })] })] })] })] })) : null] }), glossaryOpen ? (_jsx("div", { className: "modal-shell", onClick: () => setGlossaryOpen(false), role: "presentation", children: _jsxs("div", { className: "modal-card glossary-modal", onClick: (event) => event.stopPropagation(), role: "dialog", "aria-modal": "true", "aria-label": "Mechanic glossary", children: [_jsxs("div", { className: "panel-header", children: [_jsxs("div", { children: [_jsx("h2", { children: "Mechanic Glossary" }), _jsxs("span", { children: [glossaryItems.length, " visible mechanics"] })] }), _jsx("button", { className: "ghost-button subtle-button", onClick: () => setGlossaryOpen(false), type: "button", children: "Close" })] }), _jsxs("label", { className: "field", children: [_jsx("span", { children: "Find a mechanic" }), _jsx("input", { value: glossaryQuery, onChange: (event) => setGlossaryQuery(event.target.value), placeholder: "Search names and definitions" })] }), _jsxs("div", { className: "glossary-list modal-glossary-list", children: [glossaryFavorites.length ? (_jsxs("section", { className: "glossary-group", children: [_jsx("h3", { children: "Pinned" }), glossaryFavorites.map((mechanic) => {
                                             const selected = searchState.mechanics.includes(mechanic.slug);
                                             const pinned = favoriteSet.has(mechanic.slug);
                                             return (_jsxs("article", { className: selected ? "glossary-item glossary-entry active" : "glossary-item glossary-entry", children: [_jsxs("div", { className: "glossary-heading", children: [_jsx("strong", { children: mechanic.label }), _jsxs("small", { children: [mechanic.type, " \u00B7 ", mechanic.usageCount, " cards"] })] }), _jsx("p", { children: mechanic.definition }), _jsxs("div", { className: "glossary-actions", children: [_jsx("button", { className: selected ? "chip active" : "chip", onClick: () => toggleMechanic(mechanic.slug), type: "button", children: selected ? "Selected" : "Filter" }), _jsx("button", { className: pinned ? "chip active" : "chip", onClick: () => toggleFavoriteMechanic(mechanic.slug), type: "button", children: pinned ? "Pinned" : "Pin" })] })] }, `${mechanic.type}-${mechanic.slug}`));

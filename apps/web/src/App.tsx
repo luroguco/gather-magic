@@ -11,16 +11,23 @@ import {
   VerticalColorStrip
 } from "./cardPresentation";
 import {
+  capturePreviewCollectorSnapshot,
   createDeck,
   exportDeck,
   getCard,
+  getCardStats,
+  getCollectorHelperStatus,
+  importCollectorSnapshot,
   getDeck,
   getMechanics,
   getStatus,
+  importLatestCollectorSnapshot,
   getUntappedHelperStatus,
   importUntappedCollection,
   importLatestUntappedCapture,
   listDecks,
+  previewLatestCollectorSnapshot,
+  previewCollectorSnapshot,
   previewUntappedCollection,
   previewLatestUntappedCapture,
   startUntappedHelper,
@@ -32,14 +39,19 @@ import {
 } from "./api";
 import type {
   AppStatus,
+  CardStatsResponse,
   CardDetail,
   CardSummary,
+  CollectionImportSummary,
+  CollectorCaptureImportSummary,
+  CollectorCaptureStatus,
   Deck,
   DeckCard,
   DeckListItem,
   UntappedCaptureFile,
   UntappedCaptureStatus,
   Mechanic,
+  StatsBreakdownItem,
   UntappedImportSummary,
   ValidationResult
 } from "./types";
@@ -58,7 +70,7 @@ const COLORS = ["W", "U", "B", "R", "G"];
 const CARD_TYPES = ["Creature", "Instant", "Sorcery", "Artifact", "Enchantment", "Planeswalker", "Land"];
 const RARITIES = ["common", "uncommon", "rare", "mythic"];
 
-const defaultSearch = {
+const defaultFilterState = {
   q: "",
   format: "standard",
   colors: [] as string[],
@@ -66,9 +78,26 @@ const defaultSearch = {
   types: [] as string[],
   subtypes: "",
   rarity: [] as string[],
-  ownedOnly: false,
+  playableCountMin: "",
+  playableCountMax: "",
   manaValueMin: "",
   manaValueMax: ""
+};
+
+const defaultSearch = {
+  ...defaultFilterState,
+  ownedOnly: false,
+  drilldownKind: "",
+  drilldownKey: "",
+  drilldownLabel: ""
+};
+
+const defaultStatsFilters = {
+  ...defaultFilterState,
+  ownedOnly: true,
+  drilldownKind: "",
+  drilldownKey: "",
+  drilldownLabel: ""
 };
 
 const FAVORITES_STORAGE_KEY = "mtga.favorite-mechanics";
@@ -129,6 +158,7 @@ type ResultsViewMode = "grid" | "list" | "table";
 type AppTheme = (typeof THEME_OPTIONS)[number]["value"];
 type DeckSortKey = "added" | "name" | "manaValue" | "typeLine" | "quantity";
 type DeckGroupKey = "none" | "section" | "typeLine" | "manaValue";
+type FilterState = typeof defaultSearch;
 type TableSortKey =
   | "name"
   | "colors"
@@ -140,6 +170,9 @@ type TableSortKey =
   | "set"
   | "rarity"
   | "mechanics";
+
+type FilterStateUpdater = (updater: (current: FilterState) => FilterState) => void;
+type StatsDrilldownKind = NonNullable<FilterState["drilldownKind"]>;
 
 const toggleValue = (values: string[], value: string) =>
   values.includes(value) ? values.filter((entry) => entry !== value) : [...values, value];
@@ -228,7 +261,7 @@ const groupMechanics = (
   return sections;
 };
 
-const buildSearchParams = (state: typeof defaultSearch) => {
+const buildSearchParams = (state: FilterState) => {
   const params = new URLSearchParams();
   if (state.q.trim()) {
     params.set("q", state.q.trim());
@@ -261,16 +294,53 @@ const buildSearchParams = (state: typeof defaultSearch) => {
   if (state.ownedOnly) {
     params.set("ownedOnly", "true");
   }
+  if (state.playableCountMin) {
+    params.set("playableCountMin", state.playableCountMin);
+  }
+  if (state.playableCountMax) {
+    params.set("playableCountMax", state.playableCountMax);
+  }
   if (state.manaValueMin) {
     params.set("manaValueMin", state.manaValueMin);
   }
   if (state.manaValueMax) {
     params.set("manaValueMax", state.manaValueMax);
   }
+  if (state.drilldownKind && state.drilldownKey) {
+    params.set("drilldownKind", state.drilldownKind);
+    params.set("drilldownKey", state.drilldownKey);
+  }
   params.set("page", "1");
   params.set("pageSize", String(SEARCH_PAGE_SIZE));
   return params;
 };
+
+const getPrimaryBreakdownValue = (item: StatsBreakdownItem, ownedOnly: boolean) =>
+  ownedOnly ? item.playableOwnedCopies : item.titleCount;
+
+const formatBreakdownMetricLabel = (ownedOnly: boolean) => (ownedOnly ? "playable copies" : "titles");
+
+const mergeSharedFilterFields = (target: FilterState, source: FilterState): FilterState => ({
+  ...target,
+  q: source.q,
+  format: source.format,
+  colors: [...source.colors],
+  mechanics: [...source.mechanics],
+  types: [...source.types],
+  subtypes: source.subtypes,
+  rarity: [...source.rarity],
+  playableCountMin: source.playableCountMin,
+  playableCountMax: source.playableCountMax,
+  manaValueMin: source.manaValueMin,
+  manaValueMax: source.manaValueMax
+});
+
+const clearDrilldownState = (state: FilterState): FilterState => ({
+  ...state,
+  drilldownKind: "",
+  drilldownKey: "",
+  drilldownLabel: ""
+});
 
 const mergeDeckCard = (
   cards: DeckCard[],
@@ -291,7 +361,7 @@ const mergeDeckCard = (
 const formatDateTime = (value: string | null) =>
   value ? new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(new Date(value)) : "Never";
 
-const formatCatalogLabel = (preview: UntappedImportSummary | null) => {
+const formatCatalogLabel = (preview: CollectionImportSummary | null) => {
   if (!preview) {
     return "Pending preview";
   }
@@ -302,6 +372,20 @@ const formatCatalogLabel = (preview: UntappedImportSummary | null) => {
 
   const buildLabel = preview.catalogMetadata?.build ? ` build ${preview.catalogMetadata.build}` : "";
   return `Untapped public${buildLabel}`;
+};
+
+const formatImportPreviewContext = (preview: CollectionImportSummary) => {
+  const parts = [formatCatalogLabel(preview)];
+
+  if (preview.snapshotMetadata?.capturedAt) {
+    parts.push(`Captured ${formatDateTime(preview.snapshotMetadata.capturedAt)}`);
+  }
+
+  if (preview.snapshotMetadata?.collectorVersion) {
+    parts.push(`Collector ${preview.snapshotMetadata.collectorVersion}`);
+  }
+
+  return parts.join(" · ");
 };
 
 const formatOwnedCount = (card: CardSummary) => {
@@ -330,6 +414,7 @@ type PendingAdd = {
   section: DeckCard["section"];
 };
 
+type CollectorPreviewSource = "manual-file" | "latest-capture";
 type UntappedPreviewSource = "manual-file" | "latest-capture";
 
 const formatFileSize = (size: number) =>
@@ -338,26 +423,40 @@ const formatFileSize = (size: number) =>
 const getUntappedCaptureIdentity = (capture: UntappedCaptureFile | null) =>
   capture ? `${capture.path}::${capture.modifiedAt}` : null;
 
+const getCollectorCaptureIdentity = (capture: CollectorCaptureStatus["latestCapture"] | null) =>
+  capture ? `${capture.path}::${capture.modifiedAt}` : null;
+
 function App() {
   const [status, setStatus] = useState<AppStatus | null>(null);
   const [mechanics, setMechanics] = useState<Mechanic[]>([]);
   const [searchState, setSearchState] = useState(defaultSearch);
   const deferredSearchState = useDeferredValue(searchState);
+  const [statsState, setStatsState] = useState(defaultStatsFilters);
+  const deferredStatsState = useDeferredValue(statsState);
   const [cards, setCards] = useState<CardSummary[]>([]);
   const [cardsTotal, setCardsTotal] = useState(0);
+  const [cardStats, setCardStats] = useState<CardStatsResponse | null>(null);
   const [visibleResultsCount, setVisibleResultsCount] = useState(INITIAL_VISIBLE_RESULTS);
   const [searchLoading, setSearchLoading] = useState(false);
+  const [statsLoading, setStatsLoading] = useState(false);
   const [deckList, setDeckList] = useState<DeckListItem[]>([]);
   const [activeDeck, setActiveDeck] = useState<Deck | null>(null);
   const [validation, setValidation] = useState<ValidationResult | null>(null);
   const [exportText, setExportText] = useState("");
-  const [activeTab, setActiveTab] = useState<"search" | "decks" | "import">("search");
+  const [activeTab, setActiveTab] = useState<"search" | "stats" | "decks" | "import">("search");
   const [deckName, setDeckName] = useState("New Arena Deck");
   const [deckFormat, setDeckFormat] = useState<Deck["format"]>("standard");
   const [quickDeckName, setQuickDeckName] = useState("Search Deck");
   const [quickDeckFormat, setQuickDeckFormat] = useState<Deck["format"]>("standard");
   const [importMessage, setImportMessage] = useState("");
   const [errorMessage, setErrorMessage] = useState("");
+  const [collectorSnapshotFile, setCollectorSnapshotFile] = useState<File | null>(null);
+  const [collectorSnapshotPreview, setCollectorSnapshotPreview] = useState<CollectionImportSummary | CollectorCaptureImportSummary | null>(null);
+  const [collectorSnapshotPreviewLoading, setCollectorSnapshotPreviewLoading] = useState(false);
+  const [collectorSnapshotImporting, setCollectorSnapshotImporting] = useState(false);
+  const [collectorHelperStatus, setCollectorHelperStatus] = useState<CollectorCaptureStatus | null>(null);
+  const [collectorHelperLoading, setCollectorHelperLoading] = useState(false);
+  const [collectorPreviewSource, setCollectorPreviewSource] = useState<CollectorPreviewSource | null>(null);
   const [untappedFile, setUntappedFile] = useState<File | null>(null);
   const [untappedPreview, setUntappedPreview] = useState<UntappedImportSummary | null>(null);
   const [untappedPreviewLoading, setUntappedPreviewLoading] = useState(false);
@@ -422,6 +521,49 @@ function App() {
     setActiveTab(nextTab);
   };
 
+  const updateSearchFilters: FilterStateUpdater = (updater) => {
+    setSearchState((current) => {
+      const next = updater(current);
+      setStatsState((other) => mergeSharedFilterFields(other, next));
+      return next;
+    });
+  };
+
+  const updateStatsFilters: FilterStateUpdater = (updater) => {
+    setStatsState((current) => {
+      const next = updater(current);
+      setSearchState((other) => mergeSharedFilterFields(other, next));
+      return next;
+    });
+  };
+
+  const openStatsSearchView = (options?: {
+    drilldownKind?: StatsDrilldownKind;
+    drilldownKey?: string;
+    drilldownLabel?: string;
+  }) => {
+    const syncedSearchState = mergeSharedFilterFields(defaultSearch, statsState);
+    setSearchState({
+      ...syncedSearchState,
+      ownedOnly: statsState.ownedOnly,
+      drilldownKind: options?.drilldownKind ?? "",
+      drilldownKey: options?.drilldownKey ?? "",
+      drilldownLabel: options?.drilldownLabel ?? ""
+    });
+    switchTab("search");
+  };
+
+  const openStatsDrilldown = (
+    drilldownKind: StatsDrilldownKind,
+    item: StatsBreakdownItem
+  ) => {
+    openStatsSearchView({
+      drilldownKind,
+      drilldownKey: item.key,
+      drilldownLabel: item.label
+    });
+  };
+
   const loadStatus = async () => {
     const nextStatus = await getStatus();
     setStatus(nextStatus);
@@ -430,6 +572,12 @@ function App() {
   const refreshUntappedHelperStatus = async () => {
     const nextStatus = await getUntappedHelperStatus();
     setUntappedHelperStatus(nextStatus);
+    return nextStatus;
+  };
+
+  const refreshCollectorHelperStatus = async () => {
+    const nextStatus = await getCollectorHelperStatus();
+    setCollectorHelperStatus(nextStatus);
     return nextStatus;
   };
 
@@ -450,6 +598,7 @@ function App() {
     await loadStatus();
     startTransition(() => {
       setSearchState((current) => ({ ...current }));
+      setStatsState((current) => ({ ...current }));
     });
   };
 
@@ -499,13 +648,33 @@ function App() {
   }, [deferredSearchState]);
 
   useEffect(() => {
+    const runStats = async () => {
+      try {
+        setStatsLoading(true);
+        const response = await getCardStats(buildSearchParams(deferredStatsState));
+        setCardStats(response);
+      } catch (error) {
+        setErrorMessage(error instanceof Error ? error.message : "Card stats failed.");
+      } finally {
+        setStatsLoading(false);
+      }
+    };
+    void runStats();
+  }, [deferredStatsState]);
+
+  useEffect(() => {
     const runMechanicsRefresh = async () => {
       try {
-        const items = await getMechanics({ ownedOnly: searchState.ownedOnly });
+        const ownedOnly = activeTab === "stats" ? statsState.ownedOnly : searchState.ownedOnly;
+        const items = await getMechanics({ ownedOnly });
         setMechanics(items);
-        if (searchState.ownedOnly) {
+        if (ownedOnly) {
           const available = new Set(items.map((item) => item.slug));
           setSearchState((current) => ({
+            ...current,
+            mechanics: current.mechanics.filter((mechanic) => available.has(mechanic))
+          }));
+          setStatsState((current) => ({
             ...current,
             mechanics: current.mechanics.filter((mechanic) => available.has(mechanic))
           }));
@@ -515,7 +684,7 @@ function App() {
       }
     };
     void runMechanicsRefresh();
-  }, [searchState.ownedOnly]);
+  }, [activeTab, searchState.ownedOnly, statsState.ownedOnly]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -556,8 +725,8 @@ function App() {
       return;
     }
 
-    void refreshUntappedHelperStatus().catch((error) => {
-      setErrorMessage(error instanceof Error ? error.message : "Failed to load Untapped helper status.");
+    void Promise.all([refreshUntappedHelperStatus(), refreshCollectorHelperStatus()]).catch((error) => {
+      setErrorMessage(error instanceof Error ? error.message : "Failed to load import helper status.");
     });
   }, [activeTab]);
 
@@ -738,6 +907,109 @@ function App() {
       await refreshCollectionViewsAfterImport();
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : "Collection import failed.");
+    }
+  };
+
+  const handleCollectorSnapshotPreview = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) {
+      return;
+    }
+
+    try {
+      setErrorMessage("");
+      setImportMessage("");
+      setCollectorSnapshotFile(file);
+      setCollectorSnapshotPreview(null);
+      setCollectorPreviewSource("manual-file");
+      setCollectorSnapshotPreviewLoading(true);
+      const preview = await previewCollectorSnapshot(file);
+      setCollectorSnapshotPreview(preview);
+    } catch (error) {
+      setCollectorSnapshotFile(null);
+      setCollectorSnapshotPreview(null);
+      setCollectorPreviewSource(null);
+      setErrorMessage(error instanceof Error ? error.message : "Collector snapshot preview failed.");
+    } finally {
+      setCollectorSnapshotPreviewLoading(false);
+    }
+  };
+
+  const handleCaptureLatestCollectorSnapshot = async () => {
+    try {
+      setErrorMessage("");
+      setImportMessage("");
+      setCollectorHelperLoading(true);
+      setCollectorSnapshotPreviewLoading(true);
+      setCollectorSnapshotFile(null);
+      setCollectorSnapshotPreview(null);
+      setCollectorPreviewSource("latest-capture");
+      const preview = await capturePreviewCollectorSnapshot();
+      setCollectorSnapshotPreview(preview);
+      setImportMessage(`Captured ${preview.capture.filename}. Review the preview and confirm import when ready.`);
+      await refreshCollectorHelperStatus();
+    } catch (error) {
+      setCollectorPreviewSource(null);
+      setErrorMessage(error instanceof Error ? error.message : "Failed to capture the live MTGA collection.");
+    } finally {
+      setCollectorHelperLoading(false);
+      setCollectorSnapshotPreviewLoading(false);
+    }
+  };
+
+  const handlePreviewLatestCollectorSnapshot = async () => {
+    try {
+      setErrorMessage("");
+      setImportMessage("");
+      setCollectorHelperLoading(true);
+      setCollectorSnapshotPreviewLoading(true);
+      setCollectorSnapshotFile(null);
+      setCollectorSnapshotPreview(null);
+      setCollectorPreviewSource("latest-capture");
+      const preview = await previewLatestCollectorSnapshot();
+      setCollectorSnapshotPreview(preview);
+      setImportMessage(`Previewed ${preview.capture.filename} from the local collector cache.`);
+      await refreshCollectorHelperStatus();
+    } catch (error) {
+      setCollectorPreviewSource(null);
+      setErrorMessage(error instanceof Error ? error.message : "Failed to preview the latest collector snapshot.");
+    } finally {
+      setCollectorHelperLoading(false);
+      setCollectorSnapshotPreviewLoading(false);
+    }
+  };
+
+  const handleConfirmCollectorSnapshotImport = async () => {
+    if (!collectorSnapshotFile && collectorPreviewSource !== "latest-capture") {
+      return;
+    }
+
+    try {
+      setErrorMessage("");
+      setImportMessage("");
+      setCollectorSnapshotImporting(true);
+      let result: CollectionImportSummary | CollectorCaptureImportSummary;
+
+      if (collectorPreviewSource === "latest-capture") {
+        result = await importLatestCollectorSnapshot();
+      } else if (collectorSnapshotFile) {
+        result = await importCollectorSnapshot(collectorSnapshotFile);
+      } else {
+        throw new Error("Choose a collector snapshot JSON or refresh from MTGA before importing.");
+      }
+
+      setCollectorSnapshotPreview(result);
+      setImportMessage(
+        `Imported ${result.ownedCopies} playable copies across ${result.ownedTitles} titles from collector snapshot. ` +
+          `${result.unresolvedCards.length} local matches unresolved, ${result.unmatchedGrpIds} grpIds unmatched.`
+      );
+      await refreshCollectionViewsAfterImport();
+      await refreshCollectorHelperStatus();
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : "Collector snapshot import failed.");
+    } finally {
+      setCollectorSnapshotImporting(false);
     }
   };
 
@@ -939,9 +1211,13 @@ function App() {
     );
   });
   const favoriteSet = new Set(favoriteMechanics);
-  const selectedMechanics = searchState.mechanics
-    .map((slug) => sortedMechanics.find((mechanic) => mechanic.slug === slug))
-    .filter((mechanic): mechanic is Mechanic => Boolean(mechanic));
+  const getSelectedMechanics = (state: FilterState) =>
+    state.mechanics
+      .map((slug) => sortedMechanics.find((mechanic) => mechanic.slug === slug))
+      .filter((mechanic): mechanic is Mechanic => Boolean(mechanic));
+  const selectedSearchMechanics = getSelectedMechanics(searchState);
+  const selectedStatsMechanics = getSelectedMechanics(statsState);
+  const sidebarMechanicSelection = activeTab === "stats" ? statsState.mechanics : searchState.mechanics;
   const sidebarFavorites = sortedMechanics.filter((mechanic) => favoriteSet.has(mechanic.slug));
   const sidebarDerivedGroups = groupMechanics(
     sortedMechanics.filter((mechanic) => mechanic.type === "derived" && !favoriteSet.has(mechanic.slug)),
@@ -964,6 +1240,14 @@ function App() {
   );
 
   const toggleMechanic = (slug: string) => {
+    if (activeTab === "stats") {
+      setStatsState((current) => ({
+        ...current,
+        mechanics: toggleValue(current.mechanics, slug)
+      }));
+      return;
+    }
+
     setSearchState((current) => ({
       ...current,
       mechanics: toggleValue(current.mechanics, slug)
@@ -1158,6 +1442,392 @@ function App() {
       </label>
     </div>
   );
+  const renderCollectionImportPreview = (
+    preview: CollectionImportSummary,
+    options: {
+      importing: boolean;
+      onConfirm: () => void;
+      contextSuffix?: string | undefined;
+    }
+  ) => (
+    <div className="untapped-preview">
+      <div className="panel-header preview-header">
+        <div>
+          <h3>Preview</h3>
+          <span>
+            {formatImportPreviewContext(preview)}
+            {options.contextSuffix ? ` · ${options.contextSuffix}` : ""}
+          </span>
+        </div>
+        <button className="primary-button" disabled={options.importing} onClick={options.onConfirm} type="button">
+          {options.importing ? "Importing..." : "Confirm import"}
+        </button>
+      </div>
+
+      <div className="snapshot-grid import-preview-grid">
+        <div className="stat-card dense">
+          <span>Owned titles</span>
+          <strong>{preview.ownedTitles}</strong>
+        </div>
+        <div className="stat-card dense">
+          <span>Playable copies</span>
+          <strong>{preview.ownedCopies}</strong>
+        </div>
+        <div className="stat-card dense">
+          <span>Variant copies</span>
+          <strong>{preview.rawOwnedCopies}</strong>
+        </div>
+        <div className="stat-card dense">
+          <span>Matched grpIds</span>
+          <strong>{preview.matchedGrpIds}</strong>
+        </div>
+        <div className="stat-card dense">
+          <span>Unmatched grpIds</span>
+          <strong>{preview.unmatchedGrpIds}</strong>
+        </div>
+        <div className="stat-card dense">
+          <span>Extracted path</span>
+          <strong>{preview.extractedPath}</strong>
+        </div>
+        {preview.snapshotMetadata?.capturedAt ? (
+          <div className="stat-card dense">
+            <span>Captured at</span>
+            <strong>{formatDateTime(preview.snapshotMetadata.capturedAt)}</strong>
+          </div>
+        ) : null}
+        {preview.snapshotMetadata?.collectorVersion ? (
+          <div className="stat-card dense">
+            <span>Collector</span>
+            <strong>{preview.snapshotMetadata.collectorVersion}</strong>
+          </div>
+        ) : null}
+      </div>
+
+      <div className="snapshot-grid import-diff-grid">
+        <div className="stat-card dense">
+          <span>Added titles</span>
+          <strong>{preview.diff.addedTitles}</strong>
+        </div>
+        <div className="stat-card dense">
+          <span>Removed titles</span>
+          <strong>{preview.diff.removedTitles}</strong>
+        </div>
+        <div className="stat-card dense">
+          <span>Changed titles</span>
+          <strong>{preview.diff.changedTitles}</strong>
+        </div>
+        <div className="stat-card dense">
+          <span>Unchanged titles</span>
+          <strong>{preview.diff.unchangedTitles}</strong>
+        </div>
+      </div>
+
+      {preview.unresolvedCards.length ? (
+        <div className="subpanel import-warning-panel">
+          <div className="panel-header">
+            <h3>Unresolved local matches</h3>
+            <span>{preview.unresolvedCards.length}</span>
+          </div>
+          <ul className="issue-list">
+            {preview.unresolvedCards.slice(0, 6).map((entry) => (
+              <li key={entry.name}>
+                {entry.name}: {entry.titleCount} playable, {entry.printCount} variant copies
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+
+      {preview.unmatchedEntries.length ? (
+        <div className="subpanel import-warning-panel">
+          <div className="panel-header">
+            <h3>Catalog misses</h3>
+            <span>{preview.unmatchedEntries.length}</span>
+          </div>
+          <ul className="issue-list">
+            {preview.unmatchedEntries.slice(0, 6).map((entry) => (
+              <li key={entry.grpId}>
+                grpId {entry.grpId}: qty {entry.quantity}
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+    </div>
+  );
+
+  const renderSharedFilters = (
+    state: FilterState,
+    updateState: FilterStateUpdater,
+    options: {
+      ownedLabel: string;
+      ownedHintOn: string;
+      ownedHintOff: string;
+      onClear: () => void;
+      selectedMechanics: Mechanic[];
+    }
+  ) => (
+    <>
+      <label className="field">
+        <span>Text</span>
+        <input
+          value={state.q}
+          onChange={(event) => updateState((current) => ({ ...current, q: event.target.value }))}
+          placeholder="Search name or oracle text"
+        />
+      </label>
+
+      <label className="field">
+        <span>Format</span>
+        <select value={state.format} onChange={(event) => updateState((current) => ({ ...current, format: event.target.value as Deck["format"] }))}>
+          {FORMATS.map(([value, label]) => (
+            <option key={value} value={value}>
+              {label}
+            </option>
+          ))}
+        </select>
+      </label>
+
+      <label className={state.ownedOnly ? "inline-toggle toggle-switch active" : "inline-toggle toggle-switch"}>
+        <input
+          className="toggle-switch-input"
+          checked={state.ownedOnly}
+          onChange={(event) => updateState((current) => ({ ...current, ownedOnly: event.target.checked }))}
+          type="checkbox"
+        />
+        <span className="toggle-switch-track" aria-hidden="true">
+          <span className="toggle-switch-thumb" />
+        </span>
+        <span className="toggle-switch-copy">
+          <strong>{options.ownedLabel}</strong>
+          <small>{state.ownedOnly ? options.ownedHintOn : options.ownedHintOff}</small>
+        </span>
+      </label>
+
+      <div className="filter-group">
+        <span>Colors</span>
+        <div className="chip-grid">
+          {COLORS.map((color) => (
+            <button
+              key={color}
+              className={state.colors.includes(color) ? "chip active" : "chip"}
+              onClick={() => updateState((current) => ({ ...current, colors: toggleValue(current.colors, color) }))}
+              type="button"
+            >
+              {color}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className="filter-group">
+        <span>Types</span>
+        <div className="chip-grid">
+          {CARD_TYPES.map((type) => (
+            <button
+              key={type}
+              className={state.types.includes(type) ? "chip active" : "chip"}
+              onClick={() => updateState((current) => ({ ...current, types: toggleValue(current.types, type) }))}
+              type="button"
+            >
+              {type}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <label className="field">
+        <span>Subtype / tribe</span>
+        <input
+          placeholder="Kithkin, Shrine, Angel"
+          value={state.subtypes}
+          onChange={(event) => updateState((current) => ({ ...current, subtypes: event.target.value }))}
+        />
+      </label>
+
+      <div className="filter-group">
+        <span>Rarity</span>
+        <div className="chip-grid">
+          {RARITIES.map((rarity) => (
+            <button
+              key={rarity}
+              className={state.rarity.includes(rarity) ? "chip active" : "chip"}
+              onClick={() => updateState((current) => ({ ...current, rarity: toggleValue(current.rarity, rarity) }))}
+              type="button"
+            >
+              {rarity}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className="filter-group">
+        <div className="filter-heading">
+          <span>Mechanics</span>
+          <button className="ghost-button subtle-button" onClick={() => setGlossaryOpen(true)} type="button">
+            Glossary
+          </button>
+        </div>
+        {options.selectedMechanics.length ? (
+          <div className="mechanic-section">
+            <span className="mechanic-section-title">Selected</span>
+            <div className="chip-grid">
+              {options.selectedMechanics.map((mechanic) => (
+                <button
+                  key={`selected-${mechanic.slug}`}
+                  className="chip active"
+                  title={mechanic.definition}
+                  onClick={() => toggleMechanic(mechanic.slug)}
+                  type="button"
+                >
+                  {mechanic.label}
+                </button>
+              ))}
+            </div>
+          </div>
+        ) : null}
+
+        {sidebarFavorites.length ? (
+          <div className="mechanic-section">
+            <span className="mechanic-section-title">Pinned</span>
+            <div className="chip-grid">
+              {sidebarFavorites.map((mechanic) => (
+                <button
+                  key={`favorite-${mechanic.slug}`}
+                  className={sidebarMechanicSelection.includes(mechanic.slug) ? "chip active" : "chip"}
+                  title={mechanic.definition}
+                  onClick={() => toggleMechanic(mechanic.slug)}
+                  type="button"
+                >
+                  {mechanic.label}
+                </button>
+              ))}
+            </div>
+          </div>
+        ) : null}
+
+        {sidebarDerivedGroups.map((section) => (
+          <div className="mechanic-section" key={`sidebar-${section.id}`}>
+            <span className="mechanic-section-title">{section.label}</span>
+            <div className="chip-grid mechanic-grid compact-grid">
+              {section.items.map((mechanic) => (
+                <button
+                  key={mechanic.slug}
+                  className={sidebarMechanicSelection.includes(mechanic.slug) ? "chip active" : "chip"}
+                  title={mechanic.definition}
+                  onClick={() => toggleMechanic(mechanic.slug)}
+                  type="button"
+                >
+                  {mechanic.label}
+                </button>
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <div className="mana-range">
+        <label className="field">
+          <span>Playable count min</span>
+          <input
+            inputMode="numeric"
+            value={state.playableCountMin}
+            onChange={(event) => updateState((current) => ({ ...current, playableCountMin: event.target.value }))}
+          />
+        </label>
+        <label className="field">
+          <span>Playable count max</span>
+          <input
+            inputMode="numeric"
+            value={state.playableCountMax}
+            onChange={(event) => updateState((current) => ({ ...current, playableCountMax: event.target.value }))}
+          />
+        </label>
+        <label className="field">
+          <span>Mana value min</span>
+          <input
+            inputMode="numeric"
+            value={state.manaValueMin}
+            onChange={(event) => updateState((current) => ({ ...current, manaValueMin: event.target.value }))}
+          />
+        </label>
+        <label className="field">
+          <span>Mana value max</span>
+          <input
+            inputMode="numeric"
+            value={state.manaValueMax}
+            onChange={(event) => updateState((current) => ({ ...current, manaValueMax: event.target.value }))}
+          />
+        </label>
+      </div>
+
+      <button className="ghost-button subtle-button filters-clear" onClick={options.onClear} type="button">
+        Clear filters
+      </button>
+    </>
+  );
+
+  const renderStatsBreakdown = (
+    title: string,
+    items: StatsBreakdownItem[],
+    drilldownKind: StatsDrilldownKind,
+    ownedOnly: boolean,
+    emptyMessage: string
+  ) => {
+    const maxValue = Math.max(...items.map((entry) => getPrimaryBreakdownValue(entry, ownedOnly)), 1);
+
+    return (
+      <section className="panel stats-section">
+        <div className="panel-header">
+          <div>
+            <h3>{title}</h3>
+            <span>Primary metric: {formatBreakdownMetricLabel(ownedOnly)}</span>
+          </div>
+          <span>{items.length} rows</span>
+        </div>
+        {items.length ? (
+          <div className="stats-breakdown-list">
+            {items.map((item) => {
+              const primaryValue = getPrimaryBreakdownValue(item, ownedOnly);
+              const width = `${Math.max((primaryValue / maxValue) * 100, primaryValue > 0 ? 4 : 0)}%`;
+              return (
+                <article className="stats-breakdown-row" key={`${title}-${item.key}`}>
+                  <div className="stats-breakdown-copy">
+                    <strong>{item.label}</strong>
+                    <span>
+                      {item.titleCount} titles · {item.playableOwnedCopies} playable · {item.rawOwnedCopies} raw
+                    </span>
+                  </div>
+                  <div className="stats-breakdown-bar-shell" aria-hidden="true">
+                    <div className="stats-breakdown-bar" style={{ width }} />
+                  </div>
+                  <div className="stats-breakdown-actions">
+                    <strong className="stats-breakdown-value">{primaryValue.toLocaleString()}</strong>
+                    <button className="ghost-button subtle-button" onClick={() => openStatsDrilldown(drilldownKind, item)} type="button">
+                      View cards
+                    </button>
+                  </div>
+                </article>
+              );
+            })}
+          </div>
+        ) : (
+          <div className="stats-empty-message">{emptyMessage}</div>
+        )}
+      </section>
+    );
+  };
+
+  const statsSummaryCards = cardStats
+    ? [
+        { label: "Matching titles", value: cardStats.summary.matchingTitles },
+        { label: "Playable owned copies", value: cardStats.summary.playableOwnedCopies },
+        { label: "Raw owned copies", value: cardStats.summary.rawOwnedCopies },
+        { label: "Average mana value", value: cardStats.summary.averageManaValue },
+        { label: "Sets represented", value: cardStats.summary.setsRepresented },
+        { label: "Mechanics represented", value: cardStats.summary.mechanicsRepresented }
+      ]
+    : [];
 
   return (
     <div className="app-shell">
@@ -1169,6 +1839,7 @@ function App() {
           <nav className="tab-strip app-tabs compact-tabs">
             {[
               ["search", "Search"],
+              ["stats", "Stats"],
               ["decks", "Decks"]
             ].map(([tab, label]) => (
               <button
@@ -1184,7 +1855,7 @@ function App() {
         </div>
         <div className="app-header-right">
           <details className="header-menu">
-            <summary className="header-menu-trigger">Stats</summary>
+            <summary className="header-menu-trigger">Catalog</summary>
             <div className="header-menu-panel stats-menu">
               <div className="header-stat-row">
                 <span>Catalog</span>
@@ -1263,7 +1934,7 @@ function App() {
         </div>
       ) : null}
 
-      <main className={activeTab === "search" ? "app-main search-main" : "app-main"}>
+      <main className={activeTab === "search" || activeTab === "stats" ? "app-main search-main" : "app-main"}>
         {activeTab === "search" ? (
           <div className={filtersCollapsed ? "search-layout filters-collapsed" : "search-layout"}>
             {!filtersCollapsed ? (
@@ -1293,229 +1964,13 @@ function App() {
                     </button>
                   </div>
                 </div>
-                  <>
-                    <label className="field">
-                      <span>Text</span>
-                      <input
-                        value={searchState.q}
-                        onChange={(event) => setSearchState({ ...searchState, q: event.target.value })}
-                        placeholder="Search name or oracle text"
-                      />
-                    </label>
-
-                    <label className="field">
-                      <span>Format</span>
-                      <select
-                        value={searchState.format}
-                        onChange={(event) =>
-                          setSearchState({ ...searchState, format: event.target.value as Deck["format"] })
-                        }
-                      >
-                        {FORMATS.map(([value, label]) => (
-                          <option key={value} value={value}>
-                            {label}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
-
-                    <label className={searchState.ownedOnly ? "inline-toggle toggle-switch active" : "inline-toggle toggle-switch"}>
-                      <input
-                        className="toggle-switch-input"
-                        checked={searchState.ownedOnly}
-                        onChange={(event) =>
-                          setSearchState({ ...searchState, ownedOnly: event.target.checked })
-                        }
-                        type="checkbox"
-                      />
-                      <span className="toggle-switch-track" aria-hidden="true">
-                        <span className="toggle-switch-thumb" />
-                      </span>
-                      <span className="toggle-switch-copy">
-                        <strong>Owned cards only</strong>
-                        <small>
-                          {searchState.ownedOnly ? "Showing only your imported collection" : "Showing the full Arena catalog"}
-                        </small>
-                      </span>
-                    </label>
-
-                    <div className="filter-group">
-                      <span>Colors</span>
-                      <div className="chip-grid">
-                        {COLORS.map((color) => (
-                          <button
-                            key={color}
-                            className={searchState.colors.includes(color) ? "chip active" : "chip"}
-                            onClick={() =>
-                              setSearchState({
-                                ...searchState,
-                                colors: toggleValue(searchState.colors, color)
-                              })
-                            }
-                            type="button"
-                          >
-                            {color}
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-
-                    <div className="filter-group">
-                      <span>Types</span>
-                      <div className="chip-grid">
-                        {CARD_TYPES.map((type) => (
-                          <button
-                            key={type}
-                            className={searchState.types.includes(type) ? "chip active" : "chip"}
-                            onClick={() =>
-                              setSearchState({
-                                ...searchState,
-                                types: toggleValue(searchState.types, type)
-                              })
-                            }
-                            type="button"
-                          >
-                            {type}
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-
-                    <label className="field">
-                      <span>Subtype / tribe</span>
-                      <input
-                        placeholder="Kithkin, Shrine, Angel"
-                        value={searchState.subtypes}
-                        onChange={(event) =>
-                          setSearchState({
-                            ...searchState,
-                            subtypes: event.target.value
-                          })
-                        }
-                      />
-                    </label>
-
-                    <div className="filter-group">
-                      <span>Rarity</span>
-                      <div className="chip-grid">
-                        {RARITIES.map((rarity) => (
-                          <button
-                            key={rarity}
-                            className={searchState.rarity.includes(rarity) ? "chip active" : "chip"}
-                            onClick={() =>
-                              setSearchState({
-                                ...searchState,
-                                rarity: toggleValue(searchState.rarity, rarity)
-                              })
-                            }
-                            type="button"
-                          >
-                            {rarity}
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-
-                    <div className="filter-group">
-                      <div className="filter-heading">
-                        <span>Mechanics</span>
-                        <button
-                          className="ghost-button subtle-button"
-                          onClick={() => setGlossaryOpen(true)}
-                          type="button"
-                        >
-                          Glossary
-                        </button>
-                      </div>
-                      {selectedMechanics.length ? (
-                        <div className="mechanic-section">
-                          <span className="mechanic-section-title">Selected</span>
-                          <div className="chip-grid">
-                            {selectedMechanics.map((mechanic) => (
-                              <button
-                                key={`selected-${mechanic.slug}`}
-                                className="chip active"
-                                title={mechanic.definition}
-                                onClick={() => toggleMechanic(mechanic.slug)}
-                                type="button"
-                              >
-                                {mechanic.label}
-                              </button>
-                            ))}
-                          </div>
-                        </div>
-                      ) : null}
-
-                      {sidebarFavorites.length ? (
-                        <div className="mechanic-section">
-                          <span className="mechanic-section-title">Pinned</span>
-                          <div className="chip-grid">
-                            {sidebarFavorites.map((mechanic) => (
-                              <button
-                                key={`favorite-${mechanic.slug}`}
-                                className={searchState.mechanics.includes(mechanic.slug) ? "chip active" : "chip"}
-                                title={mechanic.definition}
-                                onClick={() => toggleMechanic(mechanic.slug)}
-                                type="button"
-                              >
-                                {mechanic.label}
-                              </button>
-                            ))}
-                          </div>
-                        </div>
-                      ) : null}
-
-                      {sidebarDerivedGroups.map((section) => (
-                        <div className="mechanic-section" key={`sidebar-${section.id}`}>
-                          <span className="mechanic-section-title">{section.label}</span>
-                          <div className="chip-grid mechanic-grid compact-grid">
-                            {section.items.map((mechanic) => (
-                              <button
-                                key={mechanic.slug}
-                                className={searchState.mechanics.includes(mechanic.slug) ? "chip active" : "chip"}
-                                title={mechanic.definition}
-                                onClick={() => toggleMechanic(mechanic.slug)}
-                                type="button"
-                              >
-                                {mechanic.label}
-                              </button>
-                            ))}
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-
-                    <div className="mana-range">
-                      <label className="field">
-                        <span>Mana value min</span>
-                        <input
-                          inputMode="numeric"
-                          value={searchState.manaValueMin}
-                          onChange={(event) =>
-                            setSearchState({ ...searchState, manaValueMin: event.target.value })
-                          }
-                        />
-                      </label>
-                      <label className="field">
-                        <span>Mana value max</span>
-                        <input
-                          inputMode="numeric"
-                          value={searchState.manaValueMax}
-                          onChange={(event) =>
-                            setSearchState({ ...searchState, manaValueMax: event.target.value })
-                          }
-                        />
-                      </label>
-                    </div>
-
-                    <button
-                      className="ghost-button subtle-button filters-clear"
-                      onClick={() => setSearchState(defaultSearch)}
-                      type="button"
-                    >
-                      Clear filters
-                    </button>
-                  </>
+                  {renderSharedFilters(searchState, updateSearchFilters, {
+                    ownedLabel: "Owned cards only",
+                    ownedHintOn: "Showing only your imported collection",
+                    ownedHintOff: "Showing the full Arena catalog",
+                    onClear: () => updateSearchFilters(() => defaultSearch),
+                    selectedMechanics: selectedSearchMechanics
+                  })}
               </section>
             </aside>
             ) : (
@@ -1552,6 +2007,22 @@ function App() {
                   ))}
                 </div>
               </div>
+
+              {searchState.drilldownKind && searchState.drilldownLabel ? (
+                <div className="stats-drilldown-banner">
+                  <div>
+                    <strong>Metric filter active</strong>
+                    <span>Showing cards from the current filter set plus {searchState.drilldownLabel}.</span>
+                  </div>
+                  <button
+                    className="ghost-button subtle-button"
+                    onClick={() => setSearchState((current) => clearDrilldownState(current))}
+                    type="button"
+                  >
+                    Clear metric filter
+                  </button>
+                </div>
+              ) : null}
 
               {viewMode === "grid" ? (
                 <div className="results-grid">
@@ -1734,6 +2205,75 @@ function App() {
                   </div>
                 </div>
               ) : null}
+            </section>
+          </div>
+        ) : null}
+
+        {activeTab === "stats" ? (
+          <div className="search-layout stats-layout">
+            <aside className="search-sidebar">
+              <section className="panel filters-panel">
+                <div className="panel-header filters-panel-header">
+                  <div>
+                    <h2>Stats Filters</h2>
+                    <span>Reuse the same card filters, then aggregate over the matching set.</span>
+                  </div>
+                </div>
+                {renderSharedFilters(statsState, updateStatsFilters, {
+                  ownedLabel: statsState.ownedOnly ? "Owned collection" : "Full catalog",
+                  ownedHintOn: "Playable copies drive the dashboard totals",
+                  ownedHintOff: "Counts include unowned Arena cards that match the filters",
+                  onClear: () => updateStatsFilters(() => defaultStatsFilters),
+                  selectedMechanics: selectedStatsMechanics
+                })}
+              </section>
+            </aside>
+
+            <section className="stats-dashboard">
+              <section className="panel stats-hero-panel">
+                <div className="panel-header">
+                  <div>
+                    <h2>{statsState.ownedOnly ? "Owned collection stats" : "Full catalog stats"}</h2>
+                    <span>
+                      {statsLoading
+                        ? "Calculating stats..."
+                        : "Dashboard metrics are computed directly from the filtered catalog."}
+                    </span>
+                  </div>
+                </div>
+
+                {statsLoading ? (
+                  <div className="stats-empty-message">Calculating stats...</div>
+                ) : !cardStats || cardStats.summary.matchingTitles === 0 ? (
+                  <div className="stats-empty-message">No cards match the current filters.</div>
+                ) : (
+                  <>
+                    <div className="snapshot-grid stats-summary-grid">
+                      {statsSummaryCards.map((card) => (
+                        <div className="stat-card summary-drilldown-card" key={card.label}>
+                          <span>{card.label}</span>
+                          <strong>{card.value.toLocaleString()}</strong>
+                          <button className="ghost-button subtle-button summary-drilldown-button" onClick={() => openStatsSearchView()} type="button">
+                            View cards
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+
+                    <div className="stats-breakdown-grid">
+                      {renderStatsBreakdown("Color Breakdown", cardStats.breakdowns.colors, "color", statsState.ownedOnly, "No colors in the current result set.")}
+                      {renderStatsBreakdown("Mana Value Breakdown", cardStats.breakdowns.manaValues, "manaValue", statsState.ownedOnly, "No mana values available.")}
+                      {renderStatsBreakdown("Type Breakdown", cardStats.breakdowns.types, "type", statsState.ownedOnly, "No types in the current result set.")}
+                      {renderStatsBreakdown("Rarity Breakdown", cardStats.breakdowns.rarities, "rarity", statsState.ownedOnly, "No rarity data available.")}
+                    </div>
+
+                    <div className="stats-breakdown-stack">
+                      {renderStatsBreakdown("Set Breakdown", cardStats.breakdowns.sets, "set", statsState.ownedOnly, "No sets in the current result set.")}
+                      {renderStatsBreakdown("Mechanic Breakdown", cardStats.breakdowns.mechanics, "mechanic", statsState.ownedOnly, "No mechanics in the current result set.")}
+                    </div>
+                  </>
+                )}
+              </section>
             </section>
           </div>
         ) : null}
@@ -2101,106 +2641,132 @@ function App() {
                 ) : null}
 
                 {untappedPreview ? (
-                  <div className="untapped-preview">
-                    <div className="panel-header preview-header">
-                      <div>
-                        <h3>Preview</h3>
-                        <span>
-                          {formatCatalogLabel(untappedPreview)}
-                          {untappedPreviewSource === "latest-capture" && untappedHelperStatus?.latestCapture
-                            ? ` · ${untappedHelperStatus.latestCapture.filename}`
-                            : ""}
-                        </span>
+                  renderCollectionImportPreview(untappedPreview, {
+                    importing: untappedImporting,
+                    onConfirm: handleConfirmUntappedImport,
+                    contextSuffix:
+                      untappedPreviewSource === "latest-capture" && untappedHelperStatus?.latestCapture
+                        ? untappedHelperStatus.latestCapture.filename
+                        : undefined
+                  })
+                ) : null}
+              </section>
+
+              <section className="panel import-panel">
+                <div className="panel-header">
+                  <h2>Collector Snapshot</h2>
+                  <span>One-click local capture</span>
+                </div>
+
+                <p className="hero-copy">
+                  Refresh directly from the running MTGA client, preview the captured snapshot here, then replace your current collection.
+                </p>
+
+                <div className="helper-toolbar">
+                  <button
+                    className="primary-button"
+                    disabled={collectorHelperLoading || collectorSnapshotImporting}
+                    onClick={handleCaptureLatestCollectorSnapshot}
+                    type="button"
+                  >
+                    {collectorHelperLoading ? "Refreshing..." : "Refresh From MTGA"}
+                  </button>
+                  <button
+                    className="ghost-button"
+                    disabled={!collectorHelperStatus?.latestCapture || collectorHelperLoading || collectorSnapshotImporting}
+                    onClick={handlePreviewLatestCollectorSnapshot}
+                    type="button"
+                  >
+                    Preview latest snapshot
+                  </button>
+                </div>
+
+                <p className="helper-note">
+                  This uses the local signed collector host, writes a snapshot to disk, and then previews the result before import.
+                </p>
+
+                <ol className="import-steps">
+                  <li>Open MTG Arena and leave it running.</li>
+                  <li>Click <strong>Refresh From MTGA</strong>.</li>
+                  <li>Wait for the preview to appear.</li>
+                  <li>Check the counts, then click <strong>Confirm import</strong>.</li>
+                </ol>
+
+                {collectorHelperStatus ? (
+                  <div className="subpanel helper-status-panel">
+                    <div className="panel-header">
+                      <h3>Local collector status</h3>
+                      <span>{collectorHelperStatus.available ? "Ready" : "Needs attention"}</span>
+                    </div>
+                    <div className="snapshot-grid helper-status-grid">
+                      <div className="stat-card dense">
+                        <span>Collector</span>
+                        <strong>{collectorHelperStatus.available ? "Ready" : "Unavailable"}</strong>
                       </div>
-                      <button
-                        className="primary-button"
-                        disabled={untappedImporting}
-                        onClick={handleConfirmUntappedImport}
-                        type="button"
-                      >
-                        {untappedImporting ? "Importing..." : "Confirm import"}
-                      </button>
+                      <div className="stat-card dense">
+                        <span>MTGA</span>
+                        <strong>
+                          {collectorHelperStatus.mtgaRunning
+                            ? `Running${collectorHelperStatus.mtgaPid ? ` · PID ${collectorHelperStatus.mtgaPid}` : ""}`
+                            : "Not detected"}
+                        </strong>
+                      </div>
+                      <div className="stat-card dense">
+                        <span>Addon</span>
+                        <strong>{collectorHelperStatus.addonAvailable ? "Found" : "Missing"}</strong>
+                      </div>
+                      <div className="stat-card dense">
+                        <span>codesign</span>
+                        <strong>{collectorHelperStatus.codesignAvailable ? "Ready" : "Missing"}</strong>
+                      </div>
+                      <div className="stat-card dense">
+                        <span>Latest snapshot</span>
+                        <strong>{collectorHelperStatus.latestCapture ? collectorHelperStatus.latestCapture.filename : "None yet"}</strong>
+                      </div>
+                      <div className="stat-card dense">
+                        <span>Updated</span>
+                        <strong>
+                          {collectorHelperStatus.latestCapture
+                            ? formatDateTime(collectorHelperStatus.latestCapture.modifiedAt)
+                            : "Waiting"}
+                        </strong>
+                      </div>
                     </div>
 
-                    <div className="snapshot-grid import-preview-grid">
-                      <div className="stat-card dense">
-                        <span>Owned titles</span>
-                        <strong>{untappedPreview.ownedTitles}</strong>
-                      </div>
-                      <div className="stat-card dense">
-                        <span>Playable copies</span>
-                        <strong>{untappedPreview.ownedCopies}</strong>
-                      </div>
-                      <div className="stat-card dense">
-                        <span>Variant copies</span>
-                        <strong>{untappedPreview.rawOwnedCopies}</strong>
-                      </div>
-                      <div className="stat-card dense">
-                        <span>Matched grpIds</span>
-                        <strong>{untappedPreview.matchedGrpIds}</strong>
-                      </div>
-                      <div className="stat-card dense">
-                        <span>Unmatched grpIds</span>
-                        <strong>{untappedPreview.unmatchedGrpIds}</strong>
-                      </div>
-                      <div className="stat-card dense">
-                        <span>Extracted path</span>
-                        <strong>{untappedPreview.extractedPath}</strong>
-                      </div>
+                    <div className="helper-path-list">
+                      <p>
+                        <strong>Snapshot path:</strong> <code>{collectorHelperStatus.snapshotPath}</code>
+                      </p>
+                      <p>
+                        <strong>Addon path:</strong> <code>{collectorHelperStatus.addonPath}</code>
+                      </p>
                     </div>
-
-                    <div className="snapshot-grid import-diff-grid">
-                      <div className="stat-card dense">
-                        <span>Added titles</span>
-                        <strong>{untappedPreview.diff.addedTitles}</strong>
-                      </div>
-                      <div className="stat-card dense">
-                        <span>Removed titles</span>
-                        <strong>{untappedPreview.diff.removedTitles}</strong>
-                      </div>
-                      <div className="stat-card dense">
-                        <span>Changed titles</span>
-                        <strong>{untappedPreview.diff.changedTitles}</strong>
-                      </div>
-                      <div className="stat-card dense">
-                        <span>Unchanged titles</span>
-                        <strong>{untappedPreview.diff.unchangedTitles}</strong>
-                      </div>
-                    </div>
-
-                    {untappedPreview.unresolvedCards.length ? (
-                      <div className="subpanel import-warning-panel">
-                        <div className="panel-header">
-                          <h3>Unresolved local matches</h3>
-                          <span>{untappedPreview.unresolvedCards.length}</span>
-                        </div>
-                        <ul className="issue-list">
-                          {untappedPreview.unresolvedCards.slice(0, 6).map((entry) => (
-                            <li key={entry.name}>
-                              {entry.name}: {entry.titleCount} playable, {entry.printCount} variant copies
-                            </li>
-                          ))}
-                        </ul>
-                      </div>
-                    ) : null}
-
-                    {untappedPreview.unmatchedEntries.length ? (
-                      <div className="subpanel import-warning-panel">
-                        <div className="panel-header">
-                          <h3>Catalog misses</h3>
-                          <span>{untappedPreview.unmatchedEntries.length}</span>
-                        </div>
-                        <ul className="issue-list">
-                          {untappedPreview.unmatchedEntries.slice(0, 6).map((entry) => (
-                            <li key={entry.grpId}>
-                              grpId {entry.grpId}: qty {entry.quantity}
-                            </li>
-                          ))}
-                        </ul>
-                      </div>
-                    ) : null}
                   </div>
                 ) : null}
+
+                <label className="upload-drop">
+                  <input accept=".json,application/json" onChange={handleCollectorSnapshotPreview} type="file" />
+                  <span>{collectorSnapshotFile ? collectorSnapshotFile.name : "Choose your collector snapshot JSON"}</span>
+                  <small>
+                    Supports <code>{`{ snapshotVersion, collection }`}</code> or a raw <code>grpId -&gt; quantity</code> map.
+                  </small>
+                </label>
+
+                {collectorSnapshotPreviewLoading ? (
+                  <p className="empty-state">Previewing collector snapshot...</p>
+                ) : null}
+
+                {collectorSnapshotPreview
+                  ? renderCollectionImportPreview(collectorSnapshotPreview, {
+                      importing: collectorSnapshotImporting,
+                      onConfirm: handleConfirmCollectorSnapshotImport,
+                      contextSuffix:
+                        collectorPreviewSource === "latest-capture" &&
+                        "capture" in collectorSnapshotPreview
+                          ? collectorSnapshotPreview.capture.filename
+                          : undefined
+                    })
+                  : null}
               </section>
 
               <section className="panel import-panel">
