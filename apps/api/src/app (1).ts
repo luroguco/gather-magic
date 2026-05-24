@@ -5,16 +5,7 @@ import { z } from "zod";
 import { createDatabase, type DbHandle } from "./lib/database.js";
 import { ARENA_FORMATS } from "./lib/formats.js";
 import { importCollectionCsv } from "./services/collectionImport.js";
-import {
-  CARD_DRILLDOWN_KINDS,
-  getCardById,
-  getCardDataSyncSummary,
-  getCardStats,
-  getCollectionSummary,
-  listMechanics,
-  searchCards,
-  type SearchFilters
-} from "./services/cardsRepository.js";
+import { getCardById, getCollectionSummary, listMechanics, searchCards } from "./services/cardsRepository.js";
 import { createDeck, exportDeckForArena, getDeck, listDecks, updateDeck, validateDeck } from "./services/decks.js";
 import {
   UNTAPPED_CAPTURE_SNIPPET,
@@ -22,19 +13,7 @@ import {
   readLatestUntappedCapture,
   setUntappedDevToolsEnabled
 } from "./services/untappedCaptureHelper.js";
-import {
-  captureCollectorSnapshot,
-  getCollectorCaptureStatus,
-  readLatestCollectorSnapshot,
-  type CollectorCaptureHelperOptions
-} from "./services/mtgaCollectorHelper.js";
-import {
-  importCollectorSnapshotJson,
-  importUntappedCollectionJson,
-  previewCollectorSnapshotImport,
-  previewUntappedCollectionImport,
-  type UntappedCatalogSource
-} from "./services/untappedCollectionImport.js";
+import { importUntappedCollectionJson, previewUntappedCollectionImport, type UntappedCatalogSource } from "./services/untappedCollectionImport.js";
 
 const MAX_SEARCH_PAGE_SIZE = 50_000;
 
@@ -47,20 +26,10 @@ const searchQuerySchema = z.object({
   subtypes: z.string().optional(),
   rarity: z.string().optional(),
   sets: z.string().optional(),
-  drilldownKind: z.enum(CARD_DRILLDOWN_KINDS).optional(),
-  drilldownKey: z.string().optional(),
   ownedOnly: z
     .string()
     .optional()
     .transform((value) => value === "true"),
-  playableCountMin: z
-    .string()
-    .optional()
-    .transform((value) => (value ? Number.parseFloat(value) : undefined)),
-  playableCountMax: z
-    .string()
-    .optional()
-    .transform((value) => (value ? Number.parseFloat(value) : undefined)),
   manaValueMin: z
     .string()
     .optional()
@@ -109,28 +78,6 @@ const updateDeckSchema = z.object({
 const splitCsvParam = (value?: string) =>
   value?.split(",").map((entry) => entry.trim()).filter(Boolean) ?? undefined;
 
-type SearchQuery = z.infer<typeof searchQuerySchema>;
-
-const mapSearchQueryToFilters = (query: SearchQuery): SearchFilters => ({
-  q: query.q,
-  format: query.format,
-  colors: splitCsvParam(query.colors),
-  mechanics: splitCsvParam(query.mechanics),
-  types: splitCsvParam(query.types),
-  subtypes: splitCsvParam(query.subtypes),
-  rarity: splitCsvParam(query.rarity),
-  sets: splitCsvParam(query.sets),
-  drilldownKind: query.drilldownKind,
-  drilldownKey: query.drilldownKey,
-  ownedOnly: query.ownedOnly,
-  playableCountMin: query.playableCountMin,
-  playableCountMax: query.playableCountMax,
-  manaValueMin: query.manaValueMin,
-  manaValueMax: query.manaValueMax,
-  page: query.page,
-  pageSize: query.pageSize
-});
-
 export const buildApp = (
   db: DbHandle = createDatabase(),
   options?: {
@@ -139,7 +86,6 @@ export const buildApp = (
     untappedLocale?: string;
     untappedConfigPath?: string;
     untappedDownloadsPath?: string;
-    collectorHelperOptions?: CollectorCaptureHelperOptions;
   }
 ) => {
   const app = Fastify({
@@ -154,7 +100,6 @@ export const buildApp = (
     ...(options?.untappedConfigPath ? { configPath: options.untappedConfigPath } : {}),
     ...(options?.untappedDownloadsPath ? { downloadsPath: options.untappedDownloadsPath } : {})
   };
-  const collectorHelperOptions = options?.collectorHelperOptions;
 
   app.register(cors, {
     origin: true
@@ -167,8 +112,7 @@ export const buildApp = (
 
   app.get("/api/status", async () => ({
     collection: getCollectionSummary(db),
-    cards: db.prepare("SELECT COUNT(*) AS total FROM cards").get(),
-    cardData: getCardDataSyncSummary(db)
+    cards: db.prepare("SELECT COUNT(*) AS total FROM cards").get()
   }));
 
   app.get("/api/mechanics", async (request) => {
@@ -182,12 +126,21 @@ export const buildApp = (
 
   app.get("/api/cards/search", async (request) => {
     const query = searchQuerySchema.parse(request.query);
-    return searchCards(db, mapSearchQueryToFilters(query));
-  });
-
-  app.get("/api/stats/cards", async (request) => {
-    const query = searchQuerySchema.parse(request.query);
-    return getCardStats(db, mapSearchQueryToFilters(query));
+    return searchCards(db, {
+      q: query.q,
+      format: query.format,
+      colors: splitCsvParam(query.colors),
+      mechanics: splitCsvParam(query.mechanics),
+      types: splitCsvParam(query.types),
+      subtypes: splitCsvParam(query.subtypes),
+      rarity: splitCsvParam(query.rarity),
+      sets: splitCsvParam(query.sets),
+      ownedOnly: query.ownedOnly,
+      manaValueMin: query.manaValueMin,
+      manaValueMax: query.manaValueMax,
+      page: query.page,
+      pageSize: query.pageSize
+    });
   });
 
   app.get("/api/cards/:id", async (request, reply) => {
@@ -209,60 +162,6 @@ export const buildApp = (
     const csvContent = await file.toBuffer();
     const result = importCollectionCsv(db, csvContent.toString("utf8"));
     return result;
-  });
-
-  app.post("/api/imports/collector-snapshot/preview", async (request, reply) => {
-    const file = await request.file();
-    if (!file) {
-      reply.code(400);
-      return { error: "Expected a multipart file field." };
-    }
-
-    const jsonContent = await file.toBuffer();
-    return previewCollectorSnapshotImport(db, jsonContent.toString("utf8"), untappedImportOptions);
-  });
-
-  app.post("/api/imports/collector-snapshot", async (request, reply) => {
-    const file = await request.file();
-    if (!file) {
-      reply.code(400);
-      return { error: "Expected a multipart file field." };
-    }
-
-    const jsonContent = await file.toBuffer();
-    return importCollectorSnapshotJson(db, jsonContent.toString("utf8"), untappedImportOptions);
-  });
-
-  app.get("/api/imports/collector-helper/status", async () => getCollectorCaptureStatus(collectorHelperOptions));
-
-  app.post("/api/imports/collector-helper/capture-preview", async () => {
-    const { capture, content } = await captureCollectorSnapshot(collectorHelperOptions);
-    const preview = await previewCollectorSnapshotImport(db, content, untappedImportOptions);
-
-    return {
-      ...preview,
-      capture
-    };
-  });
-
-  app.post("/api/imports/collector-helper/preview-latest", async () => {
-    const { capture, content } = readLatestCollectorSnapshot(collectorHelperOptions);
-    const preview = await previewCollectorSnapshotImport(db, content, untappedImportOptions);
-
-    return {
-      ...preview,
-      capture
-    };
-  });
-
-  app.post("/api/imports/collector-helper/import-latest", async () => {
-    const { capture, content } = readLatestCollectorSnapshot(collectorHelperOptions);
-    const imported = await importCollectorSnapshotJson(db, content, untappedImportOptions);
-
-    return {
-      ...imported,
-      capture
-    };
   });
 
   app.post("/api/imports/untapped-json/preview", async (request, reply) => {

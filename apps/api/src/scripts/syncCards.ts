@@ -1,7 +1,7 @@
 import { createDatabase } from "../lib/database.js";
 import {
   collectArenaRelevantSetCodes,
-  fetchBulkData,
+  fetchBulkDataWithMetadata,
   fetchMtgJsonSetIdentifiersForCards,
   readBulkDataFromFile,
   readMtgJsonAllIdentifiersFromFile,
@@ -56,7 +56,17 @@ const parseArgs = (argv: string[]): CliOptions => {
 
 const run = async () => {
   const options = parseArgs(process.argv.slice(2));
-  const cards = options.scryfallFile ? await readBulkDataFromFile(options.scryfallFile) : await fetchBulkData();
+  const bulkData = options.scryfallFile
+    ? {
+        cards: await readBulkDataFromFile(options.scryfallFile),
+        source: {
+          source: "scryfall-default-cards",
+          sourceUpdatedAt: null,
+          downloadUri: options.scryfallFile
+        }
+      }
+    : await fetchBulkDataWithMetadata();
+  const cards = bulkData.cards;
   const mtgJsonSetCodes = options.skipMtgJson ? [] : collectArenaRelevantSetCodes(cards);
   const mtgJsonIdentifiers = options.skipMtgJson
     ? undefined
@@ -64,8 +74,13 @@ const run = async () => {
       ? await readMtgJsonAllIdentifiersFromFile(options.mtgJsonFile)
       : await fetchMtgJsonSetIdentifiersForCards(cards);
 
-  const result = syncCardsFromBulkData(db, cards, mtgJsonIdentifiers);
+  const result = syncCardsFromBulkData(db, cards, mtgJsonIdentifiers, bulkData.source);
   console.log(`Synced ${result.cardCount} cards across ${result.printCount} Arena printings.`);
+  if (result.syncMetadata) {
+    console.log(
+      `Stored ${result.syncMetadata.source} sync metadata from ${result.syncMetadata.sourceUpdatedAt ?? "unknown source date"}.`
+    );
+  }
   if (!options.skipMtgJson) {
     console.log(`Fetched MTGJSON set supplements for ${mtgJsonSetCodes.length} Arena-relevant set codes.`);
     console.log(

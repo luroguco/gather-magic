@@ -1,6 +1,6 @@
 import { getOwnedCountView } from "../lib/cardCopies.js";
 import type { DbHandle } from "../lib/database.js";
-import type { ArenaFormat } from "../lib/formats.js";
+import { ARENA_FORMATS, type ArenaFormat } from "../lib/formats.js";
 import { getMechanicDefinition } from "../lib/mechanics.js";
 import type { CardSummary } from "../lib/types.js";
 
@@ -24,7 +24,7 @@ export type SearchFilters = {
   pageSize: number;
 };
 
-export const CARD_DRILLDOWN_KINDS = ["color", "manaValue", "type", "rarity", "set", "mechanic"] as const;
+export const CARD_DRILLDOWN_KINDS = ["color", "manaValue", "type", "subtype", "tribe", "rarity", "set", "mechanic"] as const;
 export type CardDrilldownKind = (typeof CARD_DRILLDOWN_KINDS)[number];
 
 export type StatsBreakdownItem = {
@@ -33,6 +33,11 @@ export type StatsBreakdownItem = {
   titleCount: number;
   playableOwnedCopies: number;
   rawOwnedCopies: number;
+};
+
+export type StatsBreakdownTreeNode = StatsBreakdownItem & {
+  kind: "type" | "subtype" | "tribe";
+  children?: StatsBreakdownTreeNode[];
 };
 
 export type CardStatsResponse = {
@@ -66,6 +71,9 @@ export type CardStatsResponse = {
     colors: StatsBreakdownItem[];
     manaValues: StatsBreakdownItem[];
     types: StatsBreakdownItem[];
+    subtypes: StatsBreakdownItem[];
+    tribes: StatsBreakdownItem[];
+    typeTree: StatsBreakdownTreeNode[];
     rarities: StatsBreakdownItem[];
     sets: StatsBreakdownItem[];
     mechanics: StatsBreakdownItem[];
@@ -141,7 +149,169 @@ const setBucketSql = `
   END
 `;
 
+const primaryTypeOrder = [
+  "creature",
+  "instant",
+  "sorcery",
+  "artifact",
+  "enchantment",
+  "planeswalker",
+  "battle",
+  "land",
+  "other"
+] as const;
+type PrimaryTypeKey = (typeof primaryTypeOrder)[number];
+const primaryTypeSet = new Set<PrimaryTypeKey>(primaryTypeOrder);
+const primaryTypeLabels: Record<PrimaryTypeKey, string> = {
+  creature: "Creature",
+  instant: "Instant",
+  sorcery: "Sorcery",
+  artifact: "Artifact",
+  enchantment: "Enchantment",
+  planeswalker: "Planeswalker",
+  battle: "Battle",
+  land: "Land",
+  other: "Other"
+};
+
 const normalizeFilterList = (values?: string[]) => values?.filter(Boolean) ?? [];
+const sanitizeSubtypeToken = (token: string) => token.toLowerCase().replace(/[^a-z0-9'-]/g, "");
+const formatSubtypeLabel = (value: string) => value.split("-").map((part) => part.charAt(0).toUpperCase() + part.slice(1)).join("-");
+
+const parseTypeLineBreakdown = (typeLine: string): { types: PrimaryTypeKey[]; subtypes: string[]; tribes: string[] } => {
+  const [rawTypePart = "", rawSubtypePart = ""] = typeLine
+    .split(/\s+[—-]\s+/u, 2)
+    .map((part) => part.trim());
+  const typeTokens = rawTypePart
+    .toLowerCase()
+    .split(/\s+/)
+    .map((token) => token.trim())
+    .filter(Boolean);
+  const subtypeTokens = rawSubtypePart
+    .split(/\s+/)
+    .map((token) => sanitizeSubtypeToken(token.trim()))
+    .filter(Boolean);
+  const matchedTypes = primaryTypeOrder.filter((typeKey) => typeTokens.includes(typeKey));
+  const types: PrimaryTypeKey[] = matchedTypes.length > 0 ? [...matchedTypes] : ["other"];
+  const uniqueSubtypes = [...new Set(subtypeTokens)];
+  const tribes = types.includes("creature") ? uniqueSubtypes : [];
+  return {
+    types,
+    subtypes: uniqueSubtypes,
+    tribes
+  };
+};
+
+const toBreakdownItems = (entries: Iterable<StatsBreakdownItem>, sortByLabel = false): StatsBreakdownItem[] => {
+  const items = [...entries];
+  items.sort((left, right) => {
+    if (sortByLabel) {
+      return left.label.localeCompare(right.label);
+    }
+    if (right.titleCount !== left.titleCount) {
+      return right.titleCount - left.titleCount;
+    }
+    if (right.playableOwnedCopies !== left.playableOwnedCopies) {
+      return right.playableOwnedCopies - left.playableOwnedCopies;
+    }
+    return left.label.localeCompare(right.label);
+  });
+  return items;
+};
+
+const buildTypeSubtypeTribeBreakdowns = (
+  rows: Array<{ typeLine: string; playableOwnedCopies: number; rawOwnedCopies: number }>
+): { subtypes: StatsBreakdownItem[]; tribes: StatsBreakdownItem[]; typeTree: StatsBreakdownTreeNode[] } => {
+  const subtypeTotals = new Map<string, StatsBreakdownItem>();
+  const tribeTotals = new Map<string, StatsBreakdownItem>();
+  const typeTree = new Map<PrimaryTypeKey, StatsBreakdownTreeNode>();
+
+  const addBreakdown = (
+    target: Map<string, StatsBreakdownItem>,
+    key: string,
+    label: string,
+    playableOwnedCopies: number,
+    rawOwnedCopies: number
+  ) => {
+    const existing = target.get(key);
+    if (!existing) {
+      target.set(key, {
+        key,
+        label,
+        titleCount: 1,
+        playableOwnedCopies,
+        rawOwnedCopies
+      });
+      return;
+    }
+    existing.titleCount += 1;
+    existing.playableOwnedCopies += playableOwnedCopies;
+    existing.rawOwnedCopies += rawOwnedCopies;
+  };
+
+  for (const row of rows) {
+    const playableOwnedCopies = Number(row.playableOwnedCopies ?? 0);
+    const rawOwnedCopies = Number(row.rawOwnedCopies ?? 0);
+    const parsed = parseTypeLineBreakdown(String(row.typeLine ?? ""));
+
+    for (const subtype of parsed.subtypes) {
+      addBreakdown(subtypeTotals, subtype, formatSubtypeLabel(subtype), playableOwnedCopies, rawOwnedCopies);
+    }
+
+    for (const tribe of parsed.tribes) {
+      addBreakdown(tribeTotals, tribe, formatSubtypeLabel(tribe), playableOwnedCopies, rawOwnedCopies);
+    }
+
+    for (const typeKey of parsed.types) {
+      const node = typeTree.get(typeKey) ?? {
+        key: typeKey,
+        label: primaryTypeLabels[typeKey],
+        kind: "type" as const,
+        titleCount: 0,
+        playableOwnedCopies: 0,
+        rawOwnedCopies: 0,
+        children: []
+      };
+      node.titleCount += 1;
+      node.playableOwnedCopies += playableOwnedCopies;
+      node.rawOwnedCopies += rawOwnedCopies;
+
+      const childKind: "subtype" | "tribe" = typeKey === "creature" ? "tribe" : "subtype";
+      const childrenMap = new Map((node.children ?? []).map((child) => [child.key, child] as const));
+      for (const subtype of parsed.subtypes) {
+        const child = childrenMap.get(subtype) ?? {
+          key: subtype,
+          label: formatSubtypeLabel(subtype),
+          kind: childKind,
+          titleCount: 0,
+          playableOwnedCopies: 0,
+          rawOwnedCopies: 0
+        };
+        child.titleCount += 1;
+        child.playableOwnedCopies += playableOwnedCopies;
+        child.rawOwnedCopies += rawOwnedCopies;
+        childrenMap.set(subtype, child);
+      }
+      node.children = toBreakdownItems(childrenMap.values(), true).map((child) => ({
+        ...child,
+        kind: childKind
+      }));
+      typeTree.set(typeKey, node);
+    }
+  }
+
+  const orderedTypes = primaryTypeOrder
+    .map((typeKey) => typeTree.get(typeKey))
+    .filter((item): item is StatsBreakdownTreeNode => Boolean(item));
+  const extraTypes = [...typeTree.values()].filter((item) => !primaryTypeSet.has(item.key as PrimaryTypeKey));
+  extraTypes.sort((left, right) => left.label.localeCompare(right.label));
+
+  return {
+    subtypes: toBreakdownItems(subtypeTotals.values()),
+    tribes: toBreakdownItems(tribeTotals.values()),
+    typeTree: [...orderedTypes, ...extraTypes]
+  };
+};
 
 const normalizeFiltersForStats = (filters: SearchFilters) => ({
   ...(filters.q?.trim() ? { q: filters.q.trim() } : {}),
@@ -227,6 +397,10 @@ const buildCardFilterQuery = (filters: SearchFilters) => {
         break;
       case "type":
         conditions.push(`${typeBucketSql} = @drilldownKey`);
+        break;
+      case "subtype":
+      case "tribe":
+        conditions.push("lower(cards.type_line) LIKE '%' || lower(@drilldownKey) || '%'");
         break;
       case "rarity":
         conditions.push("lower(cards.rarity) = @drilldownKey");
@@ -602,6 +776,20 @@ export const getCardStats = (db: DbHandle, filters: SearchFilters): CardStatsRes
     )
     .all(params) as Array<Record<string, unknown>>;
 
+  const typeLineRows = db
+    .prepare(
+      `
+      ${cte}
+      SELECT
+        filtered_cards.type_line AS typeLine,
+        filtered_cards.playable_owned_count AS playableOwnedCopies,
+        filtered_cards.raw_owned_count AS rawOwnedCopies
+      FROM filtered_cards
+    `
+    )
+    .all(params) as Array<{ typeLine: string; playableOwnedCopies: number; rawOwnedCopies: number }>;
+  const typeSubtypeBreakdowns = buildTypeSubtypeTribeBreakdowns(typeLineRows);
+
   const mechanicsRepresentedRow = db
     .prepare(
       `
@@ -631,6 +819,9 @@ export const getCardStats = (db: DbHandle, filters: SearchFilters): CardStatsRes
       colors: buildBreakdown(colorRows, "key"),
       manaValues: buildBreakdown(manaValueRows, "key"),
       types: buildBreakdown(typeRows, "key"),
+      subtypes: typeSubtypeBreakdowns.subtypes,
+      tribes: typeSubtypeBreakdowns.tribes,
+      typeTree: typeSubtypeBreakdowns.typeTree,
       rarities: buildBreakdown(rarityRows, "key"),
       sets: buildBreakdown(setRows, "key"),
       mechanics: buildBreakdown(mechanicRows, "key")
@@ -744,4 +935,41 @@ export const getCollectionSummary = (db: DbHandle) => {
     };
 
   return summary;
+};
+
+export const getCardDataSyncSummary = (db: DbHandle) => {
+  const row = db
+    .prepare(
+      `
+      SELECT
+        source,
+        source_updated_at AS sourceUpdatedAt,
+        download_uri AS downloadUri,
+        synced_at AS syncedAt,
+        card_count AS cardCount,
+        print_count AS printCount
+      FROM card_data_syncs
+      WHERE source = 'scryfall-default-cards'
+    `
+    )
+    .get() as
+    | {
+        source: string;
+        sourceUpdatedAt: string | null;
+        downloadUri: string | null;
+        syncedAt: string;
+        cardCount: number;
+        printCount: number;
+      }
+    | undefined;
+
+  return {
+    source: row?.source ?? "scryfall-default-cards",
+    sourceUpdatedAt: row?.sourceUpdatedAt ?? null,
+    downloadUri: row?.downloadUri ?? null,
+    syncedAt: row?.syncedAt ?? null,
+    cardCount: row?.cardCount ?? 0,
+    printCount: row?.printCount ?? 0,
+    formats: [...ARENA_FORMATS]
+  };
 };

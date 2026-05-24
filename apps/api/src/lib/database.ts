@@ -57,6 +57,15 @@ const initializeSchema = (db: Database.Database) => {
       PRIMARY KEY (card_id, tag_slug)
     );
 
+    CREATE TABLE IF NOT EXISTS card_data_syncs (
+      source TEXT PRIMARY KEY,
+      source_updated_at TEXT,
+      download_uri TEXT,
+      synced_at TEXT NOT NULL,
+      card_count INTEGER NOT NULL,
+      print_count INTEGER NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS collection_cards (
       card_id TEXT PRIMARY KEY REFERENCES cards(id) ON DELETE CASCADE,
       count INTEGER NOT NULL,

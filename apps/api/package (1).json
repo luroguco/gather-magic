@@ -1,0 +1,37 @@
+{
+  "name": "@mtga/api",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "collect:mtga:collection-core": "tsx src/scripts/collectMtgaWithLldb.ts --classes CardCollection,CollectionInfo,InventoryManager,SetCollectionController,DeckBuilderModel,DeckBuilderContext,WrapperDeckBuilder --include-fields",
+    "collect:mtga:lldb": "tsx src/scripts/collectMtgaWithLldb.ts",
+    "compare:collection": "tsx src/scripts/compareCollectionSources.ts",
+    "dev": "tsx watch src/server.ts",
+    "normalize:untapped-dump": "tsx src/scripts/normalizeUntappedCollectionDump.ts",
+    "probe:mtga:native": "tsx src/scripts/probeMtgaNativeAttach.ts",
+    "probe:mtga:electron": "electron dist/scripts/probeMtgaElectronHost.js",
+    "probe:mtga": "tsx src/scripts/probeMtgaRuntime.ts",
+    "start": "node dist/server.js",
+    "test": "vitest run",
+    "untapped:devtools": "tsx src/scripts/toggleUntappedDevTools.ts",
+    "lint": "tsc -p tsconfig.json --noEmit",
+    "db:sync": "tsx src/scripts/syncCards.ts"
+  },
+  "dependencies": {
+    "@fastify/cors": "^11.1.0",
+    "@fastify/multipart": "^9.2.1",
+    "better-sqlite3": "^12.4.1",
+    "csv-parse": "^6.1.0",
+    "fastify": "^5.6.1",
+    "zod": "^4.1.11"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^24.6.0",
+    "electron": "^41.1.0",
+    "tsx": "^4.20.6",
+    "vitest": "^3.2.4"
+  }
+}

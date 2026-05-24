@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, startTransition } from "react";
+import { useDeferredValue, useEffect, useRef, useState, startTransition } from "react";
 import {
   CardCornerVisual,
   CardMetaSummary,
@@ -11,63 +11,32 @@ import {
   VerticalColorStrip
 } from "./cardPresentation";
 import {
-  capturePreviewCollectorSnapshot,
   createDeck,
   exportDeck,
   getCard,
-  getCollectorHelperStatus,
-  importCollectorSnapshot,
   getDeck,
   getMechanics,
   getStatus,
-  importLatestCollectorSnapshot,
   getUntappedHelperStatus,
   importUntappedCollection,
   importLatestUntappedCapture,
   listDecks,
-  previewLatestCollectorSnapshot,
-  previewCollectorSnapshot,
   previewUntappedCollection,
   previewLatestUntappedCapture,
   startUntappedHelper,
   stopUntappedHelper,
+  searchCards,
   updateDeck,
   uploadCollection,
   validateDeck
 } from "./api";
-import { DeckDisplayControls } from "./features/decks/DeckDisplayControls";
-import { DecksScreen } from "./features/decks/DecksScreen";
-import { ImportScreen } from "./features/import/ImportScreen";
-import { useUntappedGuidePolling } from "./features/import/useUntappedGuidePolling";
-import { SearchScreen } from "./features/search/SearchScreen";
-import { useCardSearch } from "./features/search/useCardSearch";
-import {
-  CARD_TYPES,
-  clearDrilldownState,
-  defaultSearch,
-  FORMATS,
-  ResultsViewMode,
-  groupDerivedMechanics,
-  groupKeywordMechanics,
-  toggleValue,
-  VISIBLE_RESULTS_STEP,
-  type FilterState,
-  type StatsDrilldownKind
-} from "./features/shared/filterState";
-import { useSyncedCardFilters } from "./features/shared/useSyncedCardFilters";
-import { StatsScreen } from "./features/stats/StatsScreen";
-import { useCardStats } from "./features/stats/useCardStats";
 import type {
   AppStatus,
   CardDetail,
   CardSummary,
-  CollectionImportSummary,
-  CollectorCaptureImportSummary,
-  CollectorCaptureStatus,
   Deck,
   DeckCard,
   DeckListItem,
-  StatsBreakdownItem,
   UntappedCaptureFile,
   UntappedCaptureStatus,
   Mechanic,
@@ -75,9 +44,39 @@ import type {
   ValidationResult
 } from "./types";
 
+const FORMATS = [
+  ["standard", "Standard"],
+  ["alchemy", "Alchemy"],
+  ["explorer", "Explorer"],
+  ["historic", "Historic"],
+  ["timeless", "Timeless"],
+  ["brawl", "Brawl"],
+  ["standardbrawl", "Standard Brawl"]
+] as const;
+
+const COLORS = ["W", "U", "B", "R", "G"];
+const CARD_TYPES = ["Creature", "Instant", "Sorcery", "Artifact", "Enchantment", "Planeswalker", "Land"];
+const RARITIES = ["common", "uncommon", "rare", "mythic"];
+
+const defaultSearch = {
+  q: "",
+  format: "standard",
+  colors: [] as string[],
+  mechanics: [] as string[],
+  types: [] as string[],
+  subtypes: "",
+  rarity: [] as string[],
+  ownedOnly: true,
+  manaValueMin: "",
+  manaValueMax: ""
+};
+
 const FAVORITES_STORAGE_KEY = "mtga.favorite-mechanics";
 const RESULT_VIEW_STORAGE_KEY = "mtga.search-results-view";
 const THEME_STORAGE_KEY = "mtga.app-theme";
+const SEARCH_PAGE_SIZE = 50_000;
+const INITIAL_VISIBLE_RESULTS = 120;
+const VISIBLE_RESULTS_STEP = 120;
 const THEME_OPTIONS = [
   { value: "forest", label: "Forest", tone: "dark" },
   { value: "island", label: "Island", tone: "dark" },
@@ -101,6 +100,32 @@ const UNTAPPED_CAPTURE_SNIPPET = `(async () => {
   a.click();
   URL.revokeObjectURL(url);
 })();`;
+
+const derivedBucketLabels: Record<string, string> = {
+  advantage: "Card Advantage",
+  removal: "Removal",
+  graveyard: "Graveyard",
+  tokens: "Tokens and Counters",
+  mana: "Mana and Ramp",
+  synergy: "Synergy",
+  combat: "Combat"
+};
+
+const derivedBucketOrder = ["advantage", "removal", "graveyard", "tokens", "mana", "synergy", "combat"] as const;
+
+const keywordBucketLabels: Record<string, string> = {
+  evasion: "Combat and Evasion",
+  defense: "Defense and Protection",
+  casting: "Casting and Timing",
+  resources: "Resources and Objects",
+  library: "Library and Graveyard",
+  transformation: "Transform and Alternate Casting",
+  misc: "Other Keywords"
+};
+
+const keywordBucketOrder = ["evasion", "defense", "casting", "resources", "library", "transformation", "misc"] as const;
+
+type ResultsViewMode = "grid" | "list" | "table";
 type AppTheme = (typeof THEME_OPTIONS)[number]["value"];
 type DeckSortKey = "added" | "name" | "manaValue" | "typeLine" | "quantity";
 type DeckGroupKey = "none" | "section" | "typeLine" | "manaValue";
@@ -115,6 +140,137 @@ type TableSortKey =
   | "set"
   | "rarity"
   | "mechanics";
+
+const toggleValue = (values: string[], value: string) =>
+  values.includes(value) ? values.filter((entry) => entry !== value) : [...values, value];
+
+const getDerivedBucketId = (slug: string) => {
+  if (["card-draw", "enter-the-battlefield"].includes(slug)) {
+    return "advantage";
+  }
+  if (["spot-removal", "board-wipe", "counterspell", "burn"].includes(slug)) {
+    return "removal";
+  }
+  if (
+    ["self-mill", "discard", "discard-payoff", "graveyard-recursion", "reanimation", "graveyard-hate", "death-triggers"].includes(
+      slug
+    )
+  ) {
+    return "graveyard";
+  }
+  if (["token-creation", "token-payoff", "counters-plus-one"].includes(slug)) {
+    return "tokens";
+  }
+  if (["ramp", "landfall"].includes(slug)) {
+    return "mana";
+  }
+  if (["sacrifice", "blink", "artifact-matters", "enchantment-matters", "lifegain", "lifegain-payoff", "spellslinger"].includes(slug)) {
+    return "synergy";
+  }
+  return "combat";
+};
+
+const getKeywordBucketId = (slug: string) => {
+  if (["flying", "trample", "menace", "reach", "first-strike", "double-strike", "deathtouch", "lifelink", "haste", "vigilance"].includes(slug)) {
+    return "evasion";
+  }
+  if (["ward", "hexproof", "indestructible", "protection", "defender"].includes(slug)) {
+    return "defense";
+  }
+  if (["flash", "kicker", "convoke", "spree", "bargain", "casualty", "gift", "equip", "enchant"].includes(slug)) {
+    return "casting";
+  }
+  if (["treasure", "cycling", "landwalk", "domain"].includes(slug)) {
+    return "resources";
+  }
+  if (["scry", "surveil", "mill", "flashback", "unearth", "morph", "discover"].includes(slug)) {
+    return "library";
+  }
+  if (["transform", "foretell", "plot", "disturb", "disguise", "daybound", "nightbound"].includes(slug)) {
+    return "transformation";
+  }
+  return "misc";
+};
+
+const groupMechanics = (
+  items: Mechanic[],
+  bucketFor: (slug: string) => string,
+  labels: Record<string, string>,
+  order: readonly string[]
+) => {
+  const grouped = new Map<string, Mechanic[]>();
+  for (const item of items) {
+    const bucketId = bucketFor(item.slug);
+    const bucketItems = grouped.get(bucketId) ?? [];
+    bucketItems.push(item);
+    grouped.set(bucketId, bucketItems);
+  }
+
+  const sections = order
+    .map((bucketId) => ({
+      id: bucketId,
+      label: labels[bucketId] ?? bucketId,
+      items: grouped.get(bucketId) ?? []
+    }))
+    .filter((section) => section.items.length > 0);
+
+  for (const [bucketId, bucketItems] of grouped.entries()) {
+    if (order.includes(bucketId as (typeof order)[number])) {
+      continue;
+    }
+    sections.push({
+      id: bucketId,
+      label: labels[bucketId] ?? bucketId,
+      items: bucketItems
+    });
+  }
+
+  return sections;
+};
+
+const buildSearchParams = (state: typeof defaultSearch) => {
+  const params = new URLSearchParams();
+  if (state.q.trim()) {
+    params.set("q", state.q.trim());
+  }
+  if (state.format) {
+    params.set("format", state.format);
+  }
+  if (state.colors.length) {
+    params.set("colors", state.colors.join(","));
+  }
+  if (state.mechanics.length) {
+    params.set("mechanics", state.mechanics.join(","));
+  }
+  if (state.types.length) {
+    params.set("types", state.types.join(","));
+  }
+  if (state.subtypes.trim()) {
+    params.set(
+      "subtypes",
+      state.subtypes
+        .split(",")
+        .map((value) => value.trim())
+        .filter(Boolean)
+        .join(",")
+    );
+  }
+  if (state.rarity.length) {
+    params.set("rarity", state.rarity.join(","));
+  }
+  if (state.ownedOnly) {
+    params.set("ownedOnly", "true");
+  }
+  if (state.manaValueMin) {
+    params.set("manaValueMin", state.manaValueMin);
+  }
+  if (state.manaValueMax) {
+    params.set("manaValueMax", state.manaValueMax);
+  }
+  params.set("page", "1");
+  params.set("pageSize", String(SEARCH_PAGE_SIZE));
+  return params;
+};
 
 const mergeDeckCard = (
   cards: DeckCard[],
@@ -135,7 +291,7 @@ const mergeDeckCard = (
 const formatDateTime = (value: string | null) =>
   value ? new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(new Date(value)) : "Never";
 
-const formatCatalogLabel = (preview: CollectionImportSummary | null) => {
+const formatCatalogLabel = (preview: UntappedImportSummary | null) => {
   if (!preview) {
     return "Pending preview";
   }
@@ -146,20 +302,6 @@ const formatCatalogLabel = (preview: CollectionImportSummary | null) => {
 
   const buildLabel = preview.catalogMetadata?.build ? ` build ${preview.catalogMetadata.build}` : "";
   return `Untapped public${buildLabel}`;
-};
-
-const formatImportPreviewContext = (preview: CollectionImportSummary) => {
-  const parts = [formatCatalogLabel(preview)];
-
-  if (preview.snapshotMetadata?.capturedAt) {
-    parts.push(`Captured ${formatDateTime(preview.snapshotMetadata.capturedAt)}`);
-  }
-
-  if (preview.snapshotMetadata?.collectorVersion) {
-    parts.push(`Collector ${preview.snapshotMetadata.collectorVersion}`);
-  }
-
-  return parts.join(" · ");
 };
 
 const formatOwnedCount = (card: CardSummary) => {
@@ -188,50 +330,34 @@ type PendingAdd = {
   section: DeckCard["section"];
 };
 
-type CollectorPreviewSource = "manual-file" | "latest-capture";
 type UntappedPreviewSource = "manual-file" | "latest-capture";
 
 const formatFileSize = (size: number) =>
   size >= 1024 ? `${(size / 1024).toFixed(1)} KB` : `${size} B`;
 
-const getCollectorCaptureIdentity = (capture: CollectorCaptureStatus["latestCapture"] | null) =>
-  capture ? `${capture.path}::${capture.modifiedAt}` : null;
 const getUntappedCaptureIdentity = (capture: UntappedCaptureFile | null) =>
   capture ? `${capture.path}::${capture.modifiedAt}` : null;
 
 function App() {
   const [status, setStatus] = useState<AppStatus | null>(null);
   const [mechanics, setMechanics] = useState<Mechanic[]>([]);
-  const {
-    searchState,
-    setSearchState,
-    deferredSearchState,
-    statsState,
-    setStatsState,
-    deferredStatsState,
-    updateSearchFilters,
-    updateStatsFilters,
-    openStatsSearchView,
-    openStatsDrilldown
-  } = useSyncedCardFilters();
+  const [searchState, setSearchState] = useState(defaultSearch);
+  const deferredSearchState = useDeferredValue(searchState);
+  const [cards, setCards] = useState<CardSummary[]>([]);
+  const [cardsTotal, setCardsTotal] = useState(0);
+  const [visibleResultsCount, setVisibleResultsCount] = useState(INITIAL_VISIBLE_RESULTS);
+  const [searchLoading, setSearchLoading] = useState(false);
   const [deckList, setDeckList] = useState<DeckListItem[]>([]);
   const [activeDeck, setActiveDeck] = useState<Deck | null>(null);
   const [validation, setValidation] = useState<ValidationResult | null>(null);
   const [exportText, setExportText] = useState("");
-  const [activeTab, setActiveTab] = useState<"search" | "stats" | "decks" | "import">("search");
+  const [activeTab, setActiveTab] = useState<"search" | "decks" | "import">("search");
   const [deckName, setDeckName] = useState("New Arena Deck");
   const [deckFormat, setDeckFormat] = useState<Deck["format"]>("standard");
   const [quickDeckName, setQuickDeckName] = useState("Search Deck");
   const [quickDeckFormat, setQuickDeckFormat] = useState<Deck["format"]>("standard");
   const [importMessage, setImportMessage] = useState("");
   const [errorMessage, setErrorMessage] = useState("");
-  const [collectorSnapshotFile, setCollectorSnapshotFile] = useState<File | null>(null);
-  const [collectorSnapshotPreview, setCollectorSnapshotPreview] = useState<CollectionImportSummary | CollectorCaptureImportSummary | null>(null);
-  const [collectorSnapshotPreviewLoading, setCollectorSnapshotPreviewLoading] = useState(false);
-  const [collectorSnapshotImporting, setCollectorSnapshotImporting] = useState(false);
-  const [collectorHelperStatus, setCollectorHelperStatus] = useState<CollectorCaptureStatus | null>(null);
-  const [collectorHelperLoading, setCollectorHelperLoading] = useState(false);
-  const [collectorPreviewSource, setCollectorPreviewSource] = useState<CollectorPreviewSource | null>(null);
   const [untappedFile, setUntappedFile] = useState<File | null>(null);
   const [untappedPreview, setUntappedPreview] = useState<UntappedImportSummary | null>(null);
   const [untappedPreviewLoading, setUntappedPreviewLoading] = useState(false);
@@ -285,14 +411,6 @@ function App() {
   const searchScrollTopRef = useRef(0);
   const shouldRestoreSearchScrollRef = useRef(false);
   const cardDetailCacheRef = useRef<Record<string, CardDetail>>({});
-  const {
-    cards,
-    cardsTotal,
-    visibleResultsCount,
-    setVisibleResultsCount,
-    searchLoading
-  } = useCardSearch(deferredSearchState, (message) => setErrorMessage(message));
-  const { cardStats, statsLoading } = useCardStats(deferredStatsState, (message) => setErrorMessage(message));
 
   const switchTab = (nextTab: typeof activeTab) => {
     if (typeof window !== "undefined" && activeTab === "search" && nextTab !== "search") {
@@ -315,12 +433,6 @@ function App() {
     return nextStatus;
   };
 
-  const refreshCollectorHelperStatus = async () => {
-    const nextStatus = await getCollectorHelperStatus();
-    setCollectorHelperStatus(nextStatus);
-    return nextStatus;
-  };
-
   const copyUntappedSnippetToClipboard = async (snippet: string) => {
     if (typeof navigator === "undefined" || !navigator.clipboard?.writeText) {
       return false;
@@ -338,7 +450,6 @@ function App() {
     await loadStatus();
     startTransition(() => {
       setSearchState((current) => ({ ...current }));
-      setStatsState((current) => ({ ...current }));
     });
   };
 
@@ -371,18 +482,30 @@ function App() {
   }, []);
 
   useEffect(() => {
+    const runSearch = async () => {
+      try {
+        setSearchLoading(true);
+        const response = await searchCards(buildSearchParams(deferredSearchState));
+        setCards(response.items);
+        setCardsTotal(response.total);
+        setVisibleResultsCount(Math.min(response.items.length, INITIAL_VISIBLE_RESULTS));
+      } catch (error) {
+        setErrorMessage(error instanceof Error ? error.message : "Card search failed.");
+      } finally {
+        setSearchLoading(false);
+      }
+    };
+    void runSearch();
+  }, [deferredSearchState]);
+
+  useEffect(() => {
     const runMechanicsRefresh = async () => {
       try {
-        const ownedOnly = activeTab === "stats" ? statsState.ownedOnly : searchState.ownedOnly;
-        const items = await getMechanics({ ownedOnly });
+        const items = await getMechanics({ ownedOnly: searchState.ownedOnly });
         setMechanics(items);
-        if (ownedOnly) {
+        if (searchState.ownedOnly) {
           const available = new Set(items.map((item) => item.slug));
           setSearchState((current) => ({
-            ...current,
-            mechanics: current.mechanics.filter((mechanic) => available.has(mechanic))
-          }));
-          setStatsState((current) => ({
             ...current,
             mechanics: current.mechanics.filter((mechanic) => available.has(mechanic))
           }));
@@ -392,7 +515,7 @@ function App() {
       }
     };
     void runMechanicsRefresh();
-  }, [activeTab, searchState.ownedOnly, statsState.ownedOnly]);
+  }, [searchState.ownedOnly]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -433,25 +556,73 @@ function App() {
       return;
     }
 
-    void Promise.all([refreshUntappedHelperStatus(), refreshCollectorHelperStatus()]).catch((error) => {
-      setErrorMessage(error instanceof Error ? error.message : "Failed to load import helper status.");
+    void refreshUntappedHelperStatus().catch((error) => {
+      setErrorMessage(error instanceof Error ? error.message : "Failed to load Untapped helper status.");
     });
   }, [activeTab]);
 
-  useUntappedGuidePolling({
-    activeTab,
-    untappedGuideActive,
-    lastAutoPreviewedCaptureId,
-    setUntappedHelperStatus,
-    setUntappedGuideActive,
-    setLastAutoPreviewedCaptureId,
-    setUntappedPreviewLoading,
-    setUntappedFile,
-    setUntappedPreview,
-    setUntappedPreviewSource,
-    setImportMessage,
-    onError: (message) => setErrorMessage(message)
-  });
+  useEffect(() => {
+    if (activeTab !== "import" || !untappedGuideActive || typeof window === "undefined") {
+      return;
+    }
+
+    let cancelled = false;
+
+    const poll = async () => {
+      try {
+        const nextStatus = await getUntappedHelperStatus();
+        if (cancelled) {
+          return;
+        }
+
+        setUntappedHelperStatus(nextStatus);
+        if (!nextStatus.showDevTools) {
+          setUntappedGuideActive(false);
+        }
+
+        const latestCaptureId = getUntappedCaptureIdentity(nextStatus.latestCapture);
+        if (!latestCaptureId || latestCaptureId === lastAutoPreviewedCaptureId) {
+          return;
+        }
+
+        setLastAutoPreviewedCaptureId(latestCaptureId);
+        setUntappedPreviewLoading(true);
+        try {
+          const preview = await previewLatestUntappedCapture();
+          if (cancelled) {
+            return;
+          }
+
+          setUntappedFile(null);
+          setUntappedPreview(preview);
+          setUntappedPreviewSource("latest-capture");
+          setImportMessage(`Detected new Untapped capture: ${preview.capture.filename}. Preview updated automatically.`);
+        } catch (error) {
+          if (!cancelled) {
+            setErrorMessage(error instanceof Error ? error.message : "Failed to preview the latest Untapped capture.");
+          }
+        } finally {
+          if (!cancelled) {
+            setUntappedPreviewLoading(false);
+          }
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setErrorMessage(error instanceof Error ? error.message : "Failed to poll Untapped capture status.");
+        }
+      }
+    };
+
+    void poll();
+    const intervalId = window.setInterval(() => {
+      void poll();
+    }, 2500);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+    };
+  }, [activeTab, lastAutoPreviewedCaptureId, untappedGuideActive]);
 
   const saveDeck = async (deck: Deck) => {
     const saved = await updateDeck(deck.id, {
@@ -567,109 +738,6 @@ function App() {
       await refreshCollectionViewsAfterImport();
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : "Collection import failed.");
-    }
-  };
-
-  const handleCollectorSnapshotPreview = async (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    event.target.value = "";
-    if (!file) {
-      return;
-    }
-
-    try {
-      setErrorMessage("");
-      setImportMessage("");
-      setCollectorSnapshotFile(file);
-      setCollectorSnapshotPreview(null);
-      setCollectorPreviewSource("manual-file");
-      setCollectorSnapshotPreviewLoading(true);
-      const preview = await previewCollectorSnapshot(file);
-      setCollectorSnapshotPreview(preview);
-    } catch (error) {
-      setCollectorSnapshotFile(null);
-      setCollectorSnapshotPreview(null);
-      setCollectorPreviewSource(null);
-      setErrorMessage(error instanceof Error ? error.message : "Collector snapshot preview failed.");
-    } finally {
-      setCollectorSnapshotPreviewLoading(false);
-    }
-  };
-
-  const handleCaptureLatestCollectorSnapshot = async () => {
-    try {
-      setErrorMessage("");
-      setImportMessage("");
-      setCollectorHelperLoading(true);
-      setCollectorSnapshotPreviewLoading(true);
-      setCollectorSnapshotFile(null);
-      setCollectorSnapshotPreview(null);
-      setCollectorPreviewSource("latest-capture");
-      const preview = await capturePreviewCollectorSnapshot();
-      setCollectorSnapshotPreview(preview);
-      setImportMessage(`Captured ${preview.capture.filename}. Review the preview and confirm import when ready.`);
-      await refreshCollectorHelperStatus();
-    } catch (error) {
-      setCollectorPreviewSource(null);
-      setErrorMessage(error instanceof Error ? error.message : "Failed to capture the live MTGA collection.");
-    } finally {
-      setCollectorHelperLoading(false);
-      setCollectorSnapshotPreviewLoading(false);
-    }
-  };
-
-  const handlePreviewLatestCollectorSnapshot = async () => {
-    try {
-      setErrorMessage("");
-      setImportMessage("");
-      setCollectorHelperLoading(true);
-      setCollectorSnapshotPreviewLoading(true);
-      setCollectorSnapshotFile(null);
-      setCollectorSnapshotPreview(null);
-      setCollectorPreviewSource("latest-capture");
-      const preview = await previewLatestCollectorSnapshot();
-      setCollectorSnapshotPreview(preview);
-      setImportMessage(`Previewed ${preview.capture.filename} from the local collector cache.`);
-      await refreshCollectorHelperStatus();
-    } catch (error) {
-      setCollectorPreviewSource(null);
-      setErrorMessage(error instanceof Error ? error.message : "Failed to preview the latest collector snapshot.");
-    } finally {
-      setCollectorHelperLoading(false);
-      setCollectorSnapshotPreviewLoading(false);
-    }
-  };
-
-  const handleConfirmCollectorSnapshotImport = async () => {
-    if (!collectorSnapshotFile && collectorPreviewSource !== "latest-capture") {
-      return;
-    }
-
-    try {
-      setErrorMessage("");
-      setImportMessage("");
-      setCollectorSnapshotImporting(true);
-      let result: CollectionImportSummary | CollectorCaptureImportSummary;
-
-      if (collectorPreviewSource === "latest-capture") {
-        result = await importLatestCollectorSnapshot();
-      } else if (collectorSnapshotFile) {
-        result = await importCollectorSnapshot(collectorSnapshotFile);
-      } else {
-        throw new Error("Choose a collector snapshot JSON or refresh from MTGA before importing.");
-      }
-
-      setCollectorSnapshotPreview(result);
-      setImportMessage(
-        `Imported ${result.ownedCopies} playable copies across ${result.ownedTitles} titles from collector snapshot. ` +
-          `${result.unresolvedCards.length} local matches unresolved, ${result.unmatchedGrpIds} grpIds unmatched.`
-      );
-      await refreshCollectionViewsAfterImport();
-      await refreshCollectorHelperStatus();
-    } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : "Collector snapshot import failed.");
-    } finally {
-      setCollectorSnapshotImporting(false);
     }
   };
 
@@ -871,34 +939,31 @@ function App() {
     );
   });
   const favoriteSet = new Set(favoriteMechanics);
-  const getSelectedMechanics = (state: FilterState) =>
-    state.mechanics
-      .map((slug) => sortedMechanics.find((mechanic) => mechanic.slug === slug))
-      .filter((mechanic): mechanic is Mechanic => Boolean(mechanic));
-  const selectedSearchMechanics = getSelectedMechanics(searchState);
-  const selectedStatsMechanics = getSelectedMechanics(statsState);
-  const sidebarMechanicSelection = activeTab === "stats" ? statsState.mechanics : searchState.mechanics;
+  const selectedMechanics = searchState.mechanics
+    .map((slug) => sortedMechanics.find((mechanic) => mechanic.slug === slug))
+    .filter((mechanic): mechanic is Mechanic => Boolean(mechanic));
   const sidebarFavorites = sortedMechanics.filter((mechanic) => favoriteSet.has(mechanic.slug));
-  const sidebarDerivedGroups = groupDerivedMechanics(
-    sortedMechanics.filter((mechanic) => mechanic.type === "derived" && !favoriteSet.has(mechanic.slug))
+  const sidebarDerivedGroups = groupMechanics(
+    sortedMechanics.filter((mechanic) => mechanic.type === "derived" && !favoriteSet.has(mechanic.slug)),
+    getDerivedBucketId,
+    derivedBucketLabels,
+    derivedBucketOrder
   );
   const glossaryFavorites = glossaryItems.filter((mechanic) => favoriteSet.has(mechanic.slug));
-  const glossaryDerivedGroups = groupDerivedMechanics(
-    glossaryItems.filter((mechanic) => mechanic.type === "derived" && !favoriteSet.has(mechanic.slug))
+  const glossaryDerivedGroups = groupMechanics(
+    glossaryItems.filter((mechanic) => mechanic.type === "derived" && !favoriteSet.has(mechanic.slug)),
+    getDerivedBucketId,
+    derivedBucketLabels,
+    derivedBucketOrder
   );
-  const glossaryKeywordGroups = groupKeywordMechanics(
-    glossaryItems.filter((mechanic) => mechanic.type === "keyword" && !favoriteSet.has(mechanic.slug))
+  const glossaryKeywordGroups = groupMechanics(
+    glossaryItems.filter((mechanic) => mechanic.type === "keyword" && !favoriteSet.has(mechanic.slug)),
+    getKeywordBucketId,
+    keywordBucketLabels,
+    keywordBucketOrder
   );
 
   const toggleMechanic = (slug: string) => {
-    if (activeTab === "stats") {
-      setStatsState((current) => ({
-        ...current,
-        mechanics: toggleValue(current.mechanics, slug)
-      }));
-      return;
-    }
-
     setSearchState((current) => ({
       ...current,
       mechanics: toggleValue(current.mechanics, slug)
@@ -1070,18 +1135,29 @@ function App() {
       setCardDetailLoading(false);
     }
   };
-  const handleOpenStatsSearchView = () => {
-    openStatsSearchView();
-    switchTab("search");
-  };
-
-  const handleOpenStatsDrilldown = (
-    drilldownKind: StatsDrilldownKind,
-    item: StatsBreakdownItem
-  ) => {
-    openStatsDrilldown(drilldownKind, item);
-    switchTab("search");
-  };
+  const renderDeckDisplayControls = (compact = false) => (
+    <div className={compact ? "deck-display-toolbar compact" : "deck-display-toolbar"}>
+      <label className="field inline-field">
+        <span>Sort</span>
+        <select value={deckSort} onChange={(event) => setDeckSort(event.target.value as DeckSortKey)}>
+          <option value="added">Added</option>
+          <option value="name">Name</option>
+          <option value="manaValue">Cost</option>
+          <option value="typeLine">Type</option>
+          <option value="quantity">Quantity</option>
+        </select>
+      </label>
+      <label className="field inline-field">
+        <span>Group</span>
+        <select value={deckGroup} onChange={(event) => setDeckGroup(event.target.value as DeckGroupKey)}>
+          <option value="section">Section</option>
+          <option value="typeLine">Type</option>
+          <option value="manaValue">Cost</option>
+          <option value="none">None</option>
+        </select>
+      </label>
+    </div>
+  );
 
   return (
     <div className="app-shell">
@@ -1093,7 +1169,6 @@ function App() {
           <nav className="tab-strip app-tabs compact-tabs">
             {[
               ["search", "Search"],
-              ["stats", "Stats"],
               ["decks", "Decks"]
             ].map(([tab, label]) => (
               <button
@@ -1109,7 +1184,7 @@ function App() {
         </div>
         <div className="app-header-right">
           <details className="header-menu">
-            <summary className="header-menu-trigger">Catalog</summary>
+            <summary className="header-menu-trigger">Stats</summary>
             <div className="header-menu-panel stats-menu">
               <div className="header-stat-row">
                 <span>Catalog</span>
@@ -1188,121 +1263,956 @@ function App() {
         </div>
       ) : null}
 
-      <main className={activeTab === "search" || activeTab === "stats" ? "app-main search-main" : "app-main"}>
+      <main className={activeTab === "search" ? "app-main search-main" : "app-main"}>
         {activeTab === "search" ? (
-          <SearchScreen
-            filtersCollapsed={filtersCollapsed}
-            onCollapseFilters={() => setFiltersCollapsed(true)}
-            onExpandFilters={() => setFiltersCollapsed(false)}
-            onOpenDeckDrawer={() => setDeckDrawerOpen(true)}
-            selectedDeckLabel={selectedDeckLabel}
-            activeDeckTotalCards={activeDeckTotalCards}
-            searchState={searchState}
-            updateSearchFilters={updateSearchFilters}
-            selectedSearchMechanics={selectedSearchMechanics}
-            sidebarFavorites={sidebarFavorites}
-            sidebarDerivedGroups={sidebarDerivedGroups}
-            sidebarMechanicSelection={sidebarMechanicSelection}
-            onToggleMechanic={toggleMechanic}
-            onOpenGlossary={() => setGlossaryOpen(true)}
-            cards={cards}
-            cardsTotal={cardsTotal}
-            searchLoading={searchLoading}
-            visibleResultsCount={visibleResultsCount}
-            onVisibleResultsCountChange={setVisibleResultsCount}
-            viewMode={viewMode}
-            onViewModeChange={setViewMode}
-            visibleCards={visibleCards}
-            visibleSortedCards={visibleSortedCards}
-            onClearDrilldown={() => setSearchState((current) => clearDrilldownState(current))}
-            onToggleTableSort={toggleTableSort}
-            onOpenCardDetail={(card) => void openCardDetail(card)}
-            renderActions={renderActions}
-          />
-        ) : null}
+          <div className={filtersCollapsed ? "search-layout filters-collapsed" : "search-layout"}>
+            {!filtersCollapsed ? (
+            <aside className="search-sidebar">
+              <section className="panel filters-panel">
+                <div className="panel-header filters-panel-header">
+                  <button
+                    className="ghost-button subtle-button cart-button header-cart-button"
+                    onClick={() => setDeckDrawerOpen(true)}
+                    type="button"
+                  >
+                    <span className="deck-cart-icon" aria-hidden="true">
+                      <span />
+                      <span />
+                    </span>
+                    <span className="cart-button-label">{selectedDeckLabel}</span>
+                    <span className="cart-badge">{activeDeckTotalCards}</span>
+                  </button>
+                  <div className="panel-actions">
+                    <button
+                      aria-label="Collapse filters"
+                      className="ghost-button subtle-button icon-button"
+                      onClick={() => setFiltersCollapsed(true)}
+                      type="button"
+                    >
+                      ←
+                    </button>
+                  </div>
+                </div>
+                  <>
+                    <label className="field">
+                      <span>Text</span>
+                      <input
+                        value={searchState.q}
+                        onChange={(event) => setSearchState({ ...searchState, q: event.target.value })}
+                        placeholder="Search name or oracle text"
+                      />
+                    </label>
 
-        {activeTab === "stats" ? (
-          <StatsScreen
-            statsState={statsState}
-            updateStatsFilters={updateStatsFilters}
-            selectedStatsMechanics={selectedStatsMechanics}
-            sidebarFavorites={sidebarFavorites}
-            sidebarDerivedGroups={sidebarDerivedGroups}
-            sidebarMechanicSelection={sidebarMechanicSelection}
-            onToggleMechanic={toggleMechanic}
-            onOpenGlossary={() => setGlossaryOpen(true)}
-            cardStats={cardStats}
-            statsLoading={statsLoading}
-            onOpenStatsSearchView={handleOpenStatsSearchView}
-            onOpenStatsDrilldown={handleOpenStatsDrilldown}
-          />
+                    <label className="field">
+                      <span>Format</span>
+                      <select
+                        value={searchState.format}
+                        onChange={(event) =>
+                          setSearchState({ ...searchState, format: event.target.value as Deck["format"] })
+                        }
+                      >
+                        {FORMATS.map(([value, label]) => (
+                          <option key={value} value={value}>
+                            {label}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+
+                    <label className="inline-toggle">
+                      <input
+                        checked={searchState.ownedOnly}
+                        onChange={(event) =>
+                          setSearchState({ ...searchState, ownedOnly: event.target.checked })
+                        }
+                        type="checkbox"
+                      />
+                      <span>Owned cards only</span>
+                    </label>
+
+                    <div className="filter-group">
+                      <span>Colors</span>
+                      <div className="chip-grid">
+                        {COLORS.map((color) => (
+                          <button
+                            key={color}
+                            className={searchState.colors.includes(color) ? "chip active" : "chip"}
+                            onClick={() =>
+                              setSearchState({
+                                ...searchState,
+                                colors: toggleValue(searchState.colors, color)
+                              })
+                            }
+                            type="button"
+                          >
+                            {color}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+
+                    <div className="filter-group">
+                      <span>Types</span>
+                      <div className="chip-grid">
+                        {CARD_TYPES.map((type) => (
+                          <button
+                            key={type}
+                            className={searchState.types.includes(type) ? "chip active" : "chip"}
+                            onClick={() =>
+                              setSearchState({
+                                ...searchState,
+                                types: toggleValue(searchState.types, type)
+                              })
+                            }
+                            type="button"
+                          >
+                            {type}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+
+                    <label className="field">
+                      <span>Subtype / tribe</span>
+                      <input
+                        placeholder="Kithkin, Shrine, Angel"
+                        value={searchState.subtypes}
+                        onChange={(event) =>
+                          setSearchState({
+                            ...searchState,
+                            subtypes: event.target.value
+                          })
+                        }
+                      />
+                    </label>
+
+                    <div className="filter-group">
+                      <span>Rarity</span>
+                      <div className="chip-grid">
+                        {RARITIES.map((rarity) => (
+                          <button
+                            key={rarity}
+                            className={searchState.rarity.includes(rarity) ? "chip active" : "chip"}
+                            onClick={() =>
+                              setSearchState({
+                                ...searchState,
+                                rarity: toggleValue(searchState.rarity, rarity)
+                              })
+                            }
+                            type="button"
+                          >
+                            {rarity}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+
+                    <div className="filter-group">
+                      <div className="filter-heading">
+                        <span>Mechanics</span>
+                        <button
+                          className="ghost-button subtle-button"
+                          onClick={() => setGlossaryOpen(true)}
+                          type="button"
+                        >
+                          Glossary
+                        </button>
+                      </div>
+                      {selectedMechanics.length ? (
+                        <div className="mechanic-section">
+                          <span className="mechanic-section-title">Selected</span>
+                          <div className="chip-grid">
+                            {selectedMechanics.map((mechanic) => (
+                              <button
+                                key={`selected-${mechanic.slug}`}
+                                className="chip active"
+                                title={mechanic.definition}
+                                onClick={() => toggleMechanic(mechanic.slug)}
+                                type="button"
+                              >
+                                {mechanic.label}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      ) : null}
+
+                      {sidebarFavorites.length ? (
+                        <div className="mechanic-section">
+                          <span className="mechanic-section-title">Pinned</span>
+                          <div className="chip-grid">
+                            {sidebarFavorites.map((mechanic) => (
+                              <button
+                                key={`favorite-${mechanic.slug}`}
+                                className={searchState.mechanics.includes(mechanic.slug) ? "chip active" : "chip"}
+                                title={mechanic.definition}
+                                onClick={() => toggleMechanic(mechanic.slug)}
+                                type="button"
+                              >
+                                {mechanic.label}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      ) : null}
+
+                      {sidebarDerivedGroups.map((section) => (
+                        <div className="mechanic-section" key={`sidebar-${section.id}`}>
+                          <span className="mechanic-section-title">{section.label}</span>
+                          <div className="chip-grid mechanic-grid compact-grid">
+                            {section.items.map((mechanic) => (
+                              <button
+                                key={mechanic.slug}
+                                className={searchState.mechanics.includes(mechanic.slug) ? "chip active" : "chip"}
+                                title={mechanic.definition}
+                                onClick={() => toggleMechanic(mechanic.slug)}
+                                type="button"
+                              >
+                                {mechanic.label}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+
+                    <div className="mana-range">
+                      <label className="field">
+                        <span>Mana value min</span>
+                        <input
+                          inputMode="numeric"
+                          value={searchState.manaValueMin}
+                          onChange={(event) =>
+                            setSearchState({ ...searchState, manaValueMin: event.target.value })
+                          }
+                        />
+                      </label>
+                      <label className="field">
+                        <span>Mana value max</span>
+                        <input
+                          inputMode="numeric"
+                          value={searchState.manaValueMax}
+                          onChange={(event) =>
+                            setSearchState({ ...searchState, manaValueMax: event.target.value })
+                          }
+                        />
+                      </label>
+                    </div>
+
+                    <button
+                      className="ghost-button subtle-button filters-clear"
+                      onClick={() => setSearchState(defaultSearch)}
+                      type="button"
+                    >
+                      Clear filters
+                    </button>
+                  </>
+              </section>
+            </aside>
+            ) : (
+              <button
+                aria-label="Expand filters"
+                className="ghost-button subtle-button search-expand-fab"
+                onClick={() => setFiltersCollapsed(false)}
+                type="button"
+              >
+                →
+              </button>
+            )}
+
+            <section className="panel results-panel">
+              <div className="panel-header">
+                <div className="results-header-main">
+                  <h2>Search Results</h2>
+                  <span>
+                    {searchLoading
+                      ? "Searching..."
+                      : `Showing ${Math.min(visibleResultsCount, cards.length)} of ${cardsTotal} matches`}
+                  </span>
+                </div>
+                <div className="view-toggle">
+                  {(["grid", "list", "table"] as ResultsViewMode[]).map((mode) => (
+                    <button
+                      className={viewMode === mode ? "view-button active" : "view-button"}
+                      key={mode}
+                      onClick={() => setViewMode(mode)}
+                      type="button"
+                    >
+                      {mode.charAt(0).toUpperCase() + mode.slice(1)}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {viewMode === "grid" ? (
+                <div className="results-grid">
+                  {visibleCards.map((card) => (
+                    <article className="card-tile" key={card.id}>
+                      <ColorStrip colors={getCardAccentColors(card)} />
+                      <div className="card-tile-body">
+                        <div className="card-tile-header">
+                          <div>
+                            <h3>{card.name}</h3>
+                            <p>{card.typeLine}</p>
+                          </div>
+                          <div className="card-corner">
+                            <CardCornerVisual card={card} />
+                            <OwnershipDots card={card} />
+                          </div>
+                        </div>
+                        <p className="rules-text">
+                          <RenderOraclePreview text={card.oracleText} />
+                        </p>
+                        <div className="tag-row">
+                          {card.mechanics.slice(0, 6).map((mechanic) => (
+                            <span className={`tag ${mechanic.type}`} key={mechanic.slug} title={mechanic.definition}>
+                              {mechanic.label}
+                            </span>
+                          ))}
+                        </div>
+                        <div className="card-meta">
+                          <CardMetaSummary card={card} />
+                        </div>
+                        <div className="card-actions">{renderActions(card)}</div>
+                      </div>
+                    </article>
+                  ))}
+                </div>
+              ) : null}
+
+              {viewMode === "list" ? (
+                <div className="results-list">
+                  {visibleCards.map((card) => (
+                    <article className="result-row" key={card.id}>
+                      <ColorStrip colors={getCardAccentColors(card)} />
+                      <div className="result-row-body">
+                        <div className="result-row-main">
+                          <div className="result-row-title">
+                            <strong>{card.name}</strong>
+                            <span>{card.typeLine}</span>
+                          </div>
+                          <div className="result-row-oracle">
+                            <RenderOraclePreview className="oracle-preview" text={card.oracleText} />
+                          </div>
+                          <div className="result-row-footer">
+                            <div className="card-meta">
+                              <CardMetaSummary card={card} />
+                            </div>
+                            <div className="list-mechanics">{getMechanicSummary(card, 4) || "No indexed mechanics"}</div>
+                          </div>
+                        </div>
+                        <div className="result-row-side">
+                          <CardCornerVisual card={card} compactLand />
+                          <OwnershipDots card={card} />
+                          <div className="card-actions compact-actions">{renderActions(card)}</div>
+                        </div>
+                      </div>
+                    </article>
+                  ))}
+                </div>
+              ) : null}
+
+              {viewMode === "table" ? (
+                <div className="results-table-wrap">
+                  <table className="results-table">
+                    <thead>
+                      <tr>
+                        <th>
+                          <button className="table-sort" onClick={() => toggleTableSort("name")} type="button">
+                            Name
+                          </button>
+                        </th>
+                        <th>
+                          <button className="table-sort table-sort-center" onClick={() => toggleTableSort("manaCost")} type="button">
+                            Cost
+                          </button>
+                        </th>
+                        <th>
+                          <button className="table-sort table-sort-center" onClick={() => toggleTableSort("manaValue")} type="button">
+                            MV
+                          </button>
+                        </th>
+                        <th>
+                          <button className="table-sort" onClick={() => toggleTableSort("typeLine")} type="button">
+                            Type
+                          </button>
+                        </th>
+                        <th>
+                          <button className="table-sort table-sort-center" onClick={() => toggleTableSort("ownedCount")} type="button">
+                            Playable
+                          </button>
+                        </th>
+                        <th>
+                          <button className="table-sort table-sort-center" onClick={() => toggleTableSort("rawOwnedCount")} type="button">
+                            Raw
+                          </button>
+                        </th>
+                        <th>
+                          <button className="table-sort" onClick={() => toggleTableSort("set")} type="button">
+                            Set
+                          </button>
+                        </th>
+                        <th>
+                          <button className="table-sort" onClick={() => toggleTableSort("rarity")} type="button">
+                            Rarity
+                          </button>
+                        </th>
+                        <th>
+                          <button className="table-sort" onClick={() => toggleTableSort("mechanics")} type="button">
+                            Mechanics
+                          </button>
+                        </th>
+                        <th className="table-head-center">Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {visibleSortedCards.map((card) => (
+                        <tr key={`table-${card.id}`}>
+                          <td>
+                            <button className="table-card-trigger table-name table-name-accent" onClick={() => void openCardDetail(card)} type="button">
+                              <VerticalColorStrip colors={getCardAccentColors(card)} />
+                              <strong>{card.name}</strong>
+                              <span>{card.typeLine}</span>
+                            </button>
+                          </td>
+                          <td className="table-cell-center table-cell-graphic">
+                            <CardCornerVisual card={card} compactLand />
+                          </td>
+                          <td className="table-cell-center">{card.manaValue}</td>
+                          <td>{card.typeLine}</td>
+                          <td className="table-cell-center">{card.deckBuildingLimit === null ? "∞" : card.ownedCount}</td>
+                          <td className="table-cell-center">{card.rawOwnedCount}</td>
+                          <td>{card.preferredSetCode ?? "SET"}</td>
+                          <td>{card.rarity}</td>
+                          <td>{getMechanicSummary(card, 3) || "None"}</td>
+                          <td className="table-cell-center table-cell-actions">
+                            <div className="card-actions table-actions">{renderActions(card)}</div>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              ) : null}
+
+              {!searchLoading && cards.length > 0 ? (
+                <div className="results-footer">
+                  <span className="results-summary">
+                    Loaded {cards.length.toLocaleString()} result{cards.length === 1 ? "" : "s"}
+                    {cardsTotal > cards.length ? ` of ${cardsTotal.toLocaleString()} total` : ""}
+                  </span>
+                  <div className="results-actions">
+                    {visibleResultsCount < cards.length ? (
+                      <button
+                        className="ghost-button subtle-button"
+                        onClick={() =>
+                          setVisibleResultsCount((current) => Math.min(current + VISIBLE_RESULTS_STEP, cards.length))
+                        }
+                        type="button"
+                      >
+                        Show {Math.min(VISIBLE_RESULTS_STEP, cards.length - visibleResultsCount)} more
+                      </button>
+                    ) : null}
+                    {visibleResultsCount < cards.length ? (
+                      <button
+                        className="ghost-button subtle-button"
+                        onClick={() => setVisibleResultsCount(cards.length)}
+                        type="button"
+                      >
+                        Show all loaded
+                      </button>
+                    ) : null}
+                  </div>
+                </div>
+              ) : null}
+            </section>
+          </div>
         ) : null}
 
         {activeTab === "decks" ? (
-          <DecksScreen
-            deckList={deckList}
-            activeDeck={activeDeck}
-            deckName={deckName}
-            deckFormat={deckFormat}
-            onDeckNameChange={setDeckName}
-            onDeckFormatChange={setDeckFormat}
-            onCreateDeck={() => void handleCreateDeck()}
-            onSelectDeck={(deckId) => void handleSelectDeck(deckId)}
-            onSaveDeck={(deck) => void saveDeck(deck)}
-            validation={validation}
-            onRefreshValidation={async (deckId) => {
-              setValidation(await validateDeck(deckId));
-            }}
-            onRefreshExport={async (deckId) => {
-              const arenaExport = await exportDeck(deckId);
-              setExportText(arenaExport.text);
-            }}
-            exportText={exportText}
-            deckSort={deckSort}
-            deckGroup={deckGroup}
-            onDeckSortChange={setDeckSort}
-            onDeckGroupChange={setDeckGroup}
-            sortedDeckDisplayCards={sortedDeckDisplayCards}
-            deckCardGroups={deckCardGroups}
-            onChangeDeckQuantity={(cardId, section, delta) => void handleChangeDeckQuantity(cardId, section, delta)}
-            onActiveDeckChange={setActiveDeck}
-          />
+          <div className="workspace-grid">
+            <section className="panel deck-list-panel">
+              <div className="panel-header">
+                <h2>Decks</h2>
+                <span>{deckList.length} saved</span>
+              </div>
+
+              <div className="deck-creator">
+                <label className="field">
+                  <span>Name</span>
+                  <input value={deckName} onChange={(event) => setDeckName(event.target.value)} />
+                </label>
+                <label className="field">
+                  <span>Format</span>
+                  <select
+                    value={deckFormat}
+                    onChange={(event) => setDeckFormat(event.target.value as Deck["format"])}
+                  >
+                    {FORMATS.map(([value, label]) => (
+                      <option key={value} value={value}>
+                        {label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <button className="primary-button" onClick={handleCreateDeck} type="button">
+                  Create deck
+                </button>
+              </div>
+
+              <div className="deck-list">
+                {deckList.map((deck) => (
+                  <button
+                    className={activeDeck?.id === deck.id ? "deck-list-item active" : "deck-list-item"}
+                    key={deck.id}
+                    onClick={() => handleSelectDeck(deck.id)}
+                    type="button"
+                  >
+                    <strong>{deck.name}</strong>
+                    <span>{FORMATS.find(([value]) => value === deck.format)?.[1] ?? deck.format}</span>
+                    <small>{deck.totalCards} cards</small>
+                  </button>
+                ))}
+              </div>
+            </section>
+
+            <section className="panel deck-detail-panel">
+              {activeDeck ? (
+                <>
+                  <div className="panel-header">
+                    <div>
+                      <h2>{activeDeck.name}</h2>
+                      <span>{FORMATS.find(([value]) => value === activeDeck.format)?.[1]}</span>
+                    </div>
+                    <button className="ghost-button" onClick={() => void saveDeck(activeDeck)} type="button">
+                      Save deck
+                    </button>
+                  </div>
+
+                  <label className="field">
+                    <span>Deck name</span>
+                    <input
+                      value={activeDeck.name}
+                      onChange={(event) =>
+                        setActiveDeck({
+                          ...activeDeck,
+                          name: event.target.value
+                        })
+                      }
+                    />
+                  </label>
+
+                  <label className="field">
+                    <span>Notes</span>
+                    <textarea
+                      rows={3}
+                      value={activeDeck.notes}
+                      onChange={(event) =>
+                        setActiveDeck({
+                          ...activeDeck,
+                          notes: event.target.value
+                        })
+                      }
+                    />
+                  </label>
+
+                  {renderDeckDisplayControls()}
+
+                  <div className="deck-card-list">
+                    {sortedDeckDisplayCards.length === 0 ? (
+                      <p className="empty-state">
+                        Start from the Search tab and add cards into this deck.
+                      </p>
+                    ) : (
+                      deckCardGroups.map((group) => (
+                        <section className="deck-group" key={`detail-group-${group.key}`}>
+                          {deckGroup !== "none" ? (
+                            <div className="deck-group-header">
+                              <strong>{group.label}</strong>
+                              <span>{group.items.reduce((total, item) => total + item.quantity, 0)} cards</span>
+                            </div>
+                          ) : null}
+                          {group.items.map((deckCard) => (
+                            <div className="deck-card-row" key={`${deckCard.cardId}-${deckCard.section}`}>
+                              <div className="cart-card-copy">
+                                <strong>{deckCard.displayName}</strong>
+                                <p>
+                                  {deckCard.section}
+                                  {deckCard.displayTypeLine ? ` · ${deckCard.displayTypeLine}` : ""}
+                                  {typeof deckCard.displayOwnedCount === "number" ? ` · own ${deckCard.displayOwnedCount}` : ""}
+                                </p>
+                              </div>
+                              <div className="quantity-controls">
+                                <button
+                                  onClick={() =>
+                                    handleChangeDeckQuantity(deckCard.cardId, deckCard.section, -1)
+                                  }
+                                  type="button"
+                                >
+                                  -
+                                </button>
+                                <span>{deckCard.quantity}</span>
+                                <button
+                                  onClick={() =>
+                                    handleChangeDeckQuantity(deckCard.cardId, deckCard.section, 1)
+                                  }
+                                  type="button"
+                                >
+                                  +
+                                </button>
+                              </div>
+                            </div>
+                          ))}
+                        </section>
+                      ))
+                    )}
+                  </div>
+
+                  <div className="validation-grid">
+                    <div className="subpanel">
+                      <div className="panel-header">
+                        <h3>Validation</h3>
+                        <button
+                          className="ghost-button"
+                          onClick={async () => {
+                            if (!activeDeck) {
+                              return;
+                            }
+                            setValidation(await validateDeck(activeDeck.id));
+                          }}
+                          type="button"
+                        >
+                          Refresh
+                        </button>
+                      </div>
+                      {validation?.issues.length ? (
+                        <ul className="issue-list">
+                          {validation.issues.map((issue: string) => (
+                            <li key={issue}>{issue}</li>
+                          ))}
+                        </ul>
+                      ) : (
+                        <p className="empty-state">No validation issues yet.</p>
+                      )}
+                    </div>
+
+                    <div className="subpanel">
+                      <div className="panel-header">
+                        <h3>Ownership gaps</h3>
+                        <button
+                          className="ghost-button"
+                          onClick={async () => {
+                            if (!activeDeck) {
+                              return;
+                            }
+                            const arenaExport = await exportDeck(activeDeck.id);
+                            setExportText(arenaExport.text);
+                          }}
+                          type="button"
+                        >
+                          Refresh export
+                        </button>
+                      </div>
+                      {validation?.ownershipGaps.length ? (
+                        <ul className="issue-list">
+                          {validation.ownershipGaps.map((gap: ValidationResult["ownershipGaps"][number]) => (
+                            <li key={gap.cardId}>
+                              {gap.name}: need {gap.needed}, own {gap.owned}, missing {gap.missing}
+                            </li>
+                          ))}
+                        </ul>
+                      ) : (
+                        <p className="empty-state">No ownership gaps for the current list.</p>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="subpanel export-panel">
+                    <div className="panel-header">
+                      <h3>Arena Export</h3>
+                    </div>
+                    <textarea readOnly rows={12} value={exportText} />
+                  </div>
+                </>
+              ) : (
+                <p className="empty-state">Create a deck to start building.</p>
+              )}
+            </section>
+          </div>
         ) : null}
 
         {activeTab === "import" ? (
-          <ImportScreen
-            status={status}
-            formatDateTime={formatDateTime}
-            formatFileSize={formatFileSize}
-            untappedCaptureSnippet={untappedHelperStatus?.snippet ?? UNTAPPED_CAPTURE_SNIPPET}
-            untappedHelperStatus={untappedHelperStatus}
-            untappedGuideActive={untappedGuideActive}
-            untappedHelperLoading={untappedHelperLoading}
-            untappedPreviewLoading={untappedPreviewLoading}
-            untappedPreview={untappedPreview}
-            untappedPreviewSource={untappedPreviewSource}
-            untappedImporting={untappedImporting}
-            untappedFile={untappedFile}
-            onStartUntappedGuide={() => void handleStartUntappedGuide()}
-            onCopyUntappedSnippet={() => void handleCopyUntappedSnippet()}
-            onPreviewLatestUntappedCapture={() => void handlePreviewLatestUntappedCapture()}
-            onStopUntappedGuide={() => void handleStopUntappedGuide()}
-            onUntappedPreview={(event) => void handleUntappedPreview(event)}
-            onConfirmUntappedImport={() => void handleConfirmUntappedImport()}
-            collectorHelperStatus={collectorHelperStatus}
-            collectorHelperLoading={collectorHelperLoading}
-            collectorSnapshotPreviewLoading={collectorSnapshotPreviewLoading}
-            collectorSnapshotImporting={collectorSnapshotImporting}
-            collectorSnapshotPreview={collectorSnapshotPreview}
-            collectorPreviewSource={collectorPreviewSource}
-            collectorSnapshotFile={collectorSnapshotFile}
-            onCaptureLatestCollectorSnapshot={() => void handleCaptureLatestCollectorSnapshot()}
-            onPreviewLatestCollectorSnapshot={() => void handlePreviewLatestCollectorSnapshot()}
-            onCollectorSnapshotPreview={(event) => void handleCollectorSnapshotPreview(event)}
-            onConfirmCollectorSnapshotImport={() => void handleConfirmCollectorSnapshotImport()}
-            onImportCsv={(event) => void handleImport(event)}
-            formatImportPreviewContext={formatImportPreviewContext}
-          />
+          <div className="workspace-grid import-workspace">
+            <section className="panel import-panel snapshot-panel">
+              <div className="panel-header">
+                <h2>Current Snapshot</h2>
+                <span>Collection status</span>
+              </div>
+              <div className="snapshot-grid">
+                <div className="stat-card dense">
+                  <span>Stored entries</span>
+                  <strong>{status?.collection.ownedEntries ?? 0}</strong>
+                </div>
+                <div className="stat-card dense">
+                  <span>Unique names</span>
+                  <strong>{status?.collection.uniqueNames ?? 0}</strong>
+                </div>
+                <div className="stat-card dense">
+                  <span>Owned copies</span>
+                  <strong>{status?.collection.ownedCopies ?? 0}</strong>
+                </div>
+                <div className="stat-card dense">
+                  <span>Owned rows</span>
+                  <strong>{status?.collection.importRowsWithCopies ?? 0}</strong>
+                </div>
+                <div className="stat-card dense">
+                  <span>Unresolved rows</span>
+                  <strong>{status?.collection.unresolvedEntries ?? 0}</strong>
+                </div>
+                <div className="stat-card dense">
+                  <span>Imported at</span>
+                  <strong>{formatDateTime(status?.collection.importedAt ?? null)}</strong>
+                </div>
+              </div>
+            </section>
+
+            <div className="import-stack">
+              <section className="panel import-panel">
+                <div className="panel-header">
+                  <h2>Untapped Companion</h2>
+                  <span>Safe bridge import</span>
+                </div>
+
+                <p className="hero-copy">
+                  Capture a local <code>mtga.collection</code> JSON dump from Untapped Companion,
+                  preview it here, then replace your current collection snapshot.
+                </p>
+
+                <div className="helper-toolbar">
+                  <button
+                    className="primary-button"
+                    disabled={untappedHelperLoading}
+                    onClick={handleStartUntappedGuide}
+                    type="button"
+                  >
+                    {untappedHelperLoading ? "Starting..." : "Start guided capture"}
+                  </button>
+                  <button className="ghost-button" onClick={handleCopyUntappedSnippet} type="button">
+                    Copy snippet
+                  </button>
+                  <button
+                    className="ghost-button"
+                    disabled={!untappedHelperStatus?.latestCapture || untappedPreviewLoading}
+                    onClick={handlePreviewLatestUntappedCapture}
+                    type="button"
+                  >
+                    Preview latest download
+                  </button>
+                  <button
+                    className="ghost-button"
+                    disabled={untappedHelperLoading || !untappedHelperStatus?.showDevTools}
+                    onClick={handleStopUntappedGuide}
+                    type="button"
+                  >
+                    Stop guided capture
+                  </button>
+                </div>
+
+                <p className="helper-note">
+                  Guided mode enables Untapped DevTools, watches your Downloads folder, and previews
+                  the next capture automatically after the JSON download finishes.
+                </p>
+
+                {untappedHelperStatus ? (
+                  <div className="subpanel helper-status-panel">
+                    <div className="panel-header">
+                      <h3>Local helper status</h3>
+                      <span>{untappedGuideActive ? "Watching for new captures" : "Idle"}</span>
+                    </div>
+                    <div className="snapshot-grid helper-status-grid">
+                      <div className="stat-card dense">
+                        <span>DevTools</span>
+                        <strong>{untappedHelperStatus.showDevTools ? "Enabled" : "Disabled"}</strong>
+                      </div>
+                      <div className="stat-card dense">
+                        <span>Helper</span>
+                        <strong>{untappedHelperStatus.available ? "Ready" : "Unavailable"}</strong>
+                      </div>
+                      <div className="stat-card dense">
+                        <span>Latest capture</span>
+                        <strong>{untappedHelperStatus.latestCapture ? untappedHelperStatus.latestCapture.filename : "None yet"}</strong>
+                      </div>
+                      <div className="stat-card dense">
+                        <span>Updated</span>
+                        <strong>
+                          {untappedHelperStatus.latestCapture
+                            ? formatDateTime(untappedHelperStatus.latestCapture.modifiedAt)
+                            : "Waiting"}
+                        </strong>
+                      </div>
+                    </div>
+
+                    <div className="helper-path-list">
+                      <p>
+                        <strong>Downloads:</strong> <code>{untappedHelperStatus.downloadsPath}</code>
+                      </p>
+                      <p>
+                        <strong>Config:</strong> <code>{untappedHelperStatus.configPath}</code>
+                      </p>
+                      {untappedHelperStatus.latestCapture ? (
+                        <p>
+                          <strong>Latest file:</strong> <code>{untappedHelperStatus.latestCapture.path}</code> (
+                          {formatFileSize(untappedHelperStatus.latestCapture.size)})
+                        </p>
+                      ) : null}
+                    </div>
+                  </div>
+                ) : null}
+
+                <ol className="import-steps">
+                  <li>Open Untapped Companion and MTGA Deck Builder.</li>
+                  <li>Open Untapped DevTools and run this console snippet.</li>
+                  <li>Wait for the download or upload the JSON manually if the watcher misses it.</li>
+                </ol>
+
+                <pre className="capture-snippet">
+                  <code>{untappedHelperStatus?.snippet ?? UNTAPPED_CAPTURE_SNIPPET}</code>
+                </pre>
+
+                <label className="upload-drop">
+                  <input accept=".json,application/json" onChange={handleUntappedPreview} type="file" />
+                  <span>{untappedFile ? untappedFile.name : "Choose your Untapped collection JSON"}</span>
+                  <small>
+                    Raw <code>grpId -&gt; quantity</code> map exported from the Untapped renderer.
+                  </small>
+                </label>
+
+                {untappedPreviewLoading ? (
+                  <p className="empty-state">Previewing Untapped collection...</p>
+                ) : null}
+
+                {untappedPreview ? (
+                  <div className="untapped-preview">
+                    <div className="panel-header preview-header">
+                      <div>
+                        <h3>Preview</h3>
+                        <span>
+                          {formatCatalogLabel(untappedPreview)}
+                          {untappedPreviewSource === "latest-capture" && untappedHelperStatus?.latestCapture
+                            ? ` · ${untappedHelperStatus.latestCapture.filename}`
+                            : ""}
+                        </span>
+                      </div>
+                      <button
+                        className="primary-button"
+                        disabled={untappedImporting}
+                        onClick={handleConfirmUntappedImport}
+                        type="button"
+                      >
+                        {untappedImporting ? "Importing..." : "Confirm import"}
+                      </button>
+                    </div>
+
+                    <div className="snapshot-grid import-preview-grid">
+                      <div className="stat-card dense">
+                        <span>Owned titles</span>
+                        <strong>{untappedPreview.ownedTitles}</strong>
+                      </div>
+                      <div className="stat-card dense">
+                        <span>Playable copies</span>
+                        <strong>{untappedPreview.ownedCopies}</strong>
+                      </div>
+                      <div className="stat-card dense">
+                        <span>Variant copies</span>
+                        <strong>{untappedPreview.rawOwnedCopies}</strong>
+                      </div>
+                      <div className="stat-card dense">
+                        <span>Matched grpIds</span>
+                        <strong>{untappedPreview.matchedGrpIds}</strong>
+                      </div>
+                      <div className="stat-card dense">
+                        <span>Unmatched grpIds</span>
+                        <strong>{untappedPreview.unmatchedGrpIds}</strong>
+                      </div>
+                      <div className="stat-card dense">
+                        <span>Extracted path</span>
+                        <strong>{untappedPreview.extractedPath}</strong>
+                      </div>
+                    </div>
+
+                    <div className="snapshot-grid import-diff-grid">
+                      <div className="stat-card dense">
+                        <span>Added titles</span>
+                        <strong>{untappedPreview.diff.addedTitles}</strong>
+                      </div>
+                      <div className="stat-card dense">
+                        <span>Removed titles</span>
+                        <strong>{untappedPreview.diff.removedTitles}</strong>
+                      </div>
+                      <div className="stat-card dense">
+                        <span>Changed titles</span>
+                        <strong>{untappedPreview.diff.changedTitles}</strong>
+                      </div>
+                      <div className="stat-card dense">
+                        <span>Unchanged titles</span>
+                        <strong>{untappedPreview.diff.unchangedTitles}</strong>
+                      </div>
+                    </div>
+
+                    {untappedPreview.unresolvedCards.length ? (
+                      <div className="subpanel import-warning-panel">
+                        <div className="panel-header">
+                          <h3>Unresolved local matches</h3>
+                          <span>{untappedPreview.unresolvedCards.length}</span>
+                        </div>
+                        <ul className="issue-list">
+                          {untappedPreview.unresolvedCards.slice(0, 6).map((entry) => (
+                            <li key={entry.name}>
+                              {entry.name}: {entry.titleCount} playable, {entry.printCount} variant copies
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    ) : null}
+
+                    {untappedPreview.unmatchedEntries.length ? (
+                      <div className="subpanel import-warning-panel">
+                        <div className="panel-header">
+                          <h3>Catalog misses</h3>
+                          <span>{untappedPreview.unmatchedEntries.length}</span>
+                        </div>
+                        <ul className="issue-list">
+                          {untappedPreview.unmatchedEntries.slice(0, 6).map((entry) => (
+                            <li key={entry.grpId}>
+                              grpId {entry.grpId}: qty {entry.quantity}
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    ) : null}
+                  </div>
+                ) : null}
+              </section>
+
+              <section className="panel import-panel">
+                <div className="panel-header">
+                  <h2>Collection CSV</h2>
+                  <span>Fallback import</span>
+                </div>
+
+                <p className="hero-copy">
+                  Upload an MTG Arena collection export. The new file replaces the current ownership
+                  snapshot atomically.
+                </p>
+
+                <label className="upload-drop">
+                  <input accept=".csv,text/csv" onChange={handleImport} type="file" />
+                  <span>Choose your Arena collection CSV</span>
+                  <small>Required columns: Id, Name, Set, Color, Rarity, Count, PrintCount</small>
+                </label>
+              </section>
+            </div>
+          </div>
         ) : null}
       </main>
 
@@ -1698,13 +2608,7 @@ function App() {
                 </div>
 
                 <div className="drawer-controls">
-                  <DeckDisplayControls
-                    compact
-                    deckSort={deckSort}
-                    deckGroup={deckGroup}
-                    onDeckSortChange={setDeckSort}
-                    onDeckGroupChange={setDeckGroup}
-                  />
+                  {renderDeckDisplayControls(true)}
                   <div className="drawer-actions">
                     <button className="ghost-button subtle-button" onClick={handleOpenDeckDetails} type="button">
                       Open full deck

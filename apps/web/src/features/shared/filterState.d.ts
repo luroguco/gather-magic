@@ -25,7 +25,7 @@ export type FilterState = {
 };
 export type FilterStateUpdater = (updater: (current: FilterState) => FilterState) => void;
 export type ResultsViewMode = "grid" | "list" | "table";
-export type StatsDrilldownKind = "color" | "manaValue" | "type" | "rarity" | "set" | "mechanic";
+export type StatsDrilldownKind = "color" | "manaValue" | "type" | "subtype" | "tribe" | "rarity" | "set" | "mechanic";
 export type MechanicSection = {
     id: string;
     label: string;

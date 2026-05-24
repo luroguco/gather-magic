@@ -210,6 +210,46 @@ describe("MTGA collection API", () => {
       "other",
       "sorcery"
     ]);
+    expect(payload.breakdowns.subtypes.map((item: { key: string }) => item.key)).toEqual(["angel"]);
+    expect(payload.breakdowns.tribes.map((item: { key: string }) => item.key)).toEqual(["angel"]);
+    expect(payload.breakdowns.typeTree).toEqual([
+      {
+        key: "creature",
+        label: "Creature",
+        kind: "type",
+        titleCount: 1,
+        playableOwnedCopies: 2,
+        rawOwnedCopies: 2,
+        children: [
+          {
+            key: "angel",
+            label: "Angel",
+            kind: "tribe",
+            titleCount: 1,
+            playableOwnedCopies: 2,
+            rawOwnedCopies: 2
+          }
+        ]
+      },
+      {
+        key: "sorcery",
+        label: "Sorcery",
+        kind: "type",
+        titleCount: 1,
+        playableOwnedCopies: 1,
+        rawOwnedCopies: 1,
+        children: []
+      },
+      {
+        key: "other",
+        label: "Other",
+        kind: "type",
+        titleCount: 1,
+        playableOwnedCopies: 1,
+        rawOwnedCopies: 1,
+        children: []
+      }
+    ]);
   });
 
   it("returns full-catalog stats and respects filters", async () => {
@@ -264,6 +304,20 @@ describe("MTGA collection API", () => {
     });
     expect(mechanicResponse.statusCode).toBe(200);
     expect(mechanicResponse.json().items.map((item: { name: string }) => item.name)).toEqual(["Angelic Blink"]);
+
+    const subtypeResponse = await app.inject({
+      method: "GET",
+      url: "/api/cards/search?ownedOnly=true&drilldownKind=subtype&drilldownKey=angel"
+    });
+    expect(subtypeResponse.statusCode).toBe(200);
+    expect(subtypeResponse.json().items.map((item: { name: string }) => item.name)).toEqual(["Angelic Blink"]);
+
+    const tribeResponse = await app.inject({
+      method: "GET",
+      url: "/api/cards/search?ownedOnly=true&drilldownKind=tribe&drilldownKey=angel"
+    });
+    expect(tribeResponse.statusCode).toBe(200);
+    expect(tribeResponse.json().items.map((item: { name: string }) => item.name)).toEqual(["Angelic Blink"]);
   });
 
   it("limits mechanic stats to the filtered subset without duplicate inflation", async () => {
@@ -555,5 +609,64 @@ describe("MTGA collection API", () => {
     expect(response.statusCode).toBe(200);
     const payload = response.json();
     expect(payload.items.some((item: { name: string }) => item.name === "Dawnfall")).toBe(false);
+  });
+
+  it("treats restricted cards as playable and banned cards as unplayable for format search", async () => {
+    syncCardsFromBulkData(db, [
+      {
+        id: "print-restricted",
+        oracle_id: "oracle-restricted",
+        arena_id: 3001,
+        name: "Restricted Probe",
+        oracle_text: "Add three mana.",
+        mana_cost: "{0}",
+        cmc: 0,
+        colors: [],
+        color_identity: [],
+        type_line: "Artifact",
+        rarity: "mythic",
+        layout: "normal",
+        keywords: [],
+        legalities: {
+          standard: "restricted"
+        },
+        set: "RSP",
+        collector_number: "1",
+        released_at: "2026-01-01",
+        games: ["arena"]
+      },
+      {
+        id: "print-banned",
+        oracle_id: "oracle-banned",
+        arena_id: 3002,
+        name: "Banned Probe",
+        oracle_text: "Take an extra turn.",
+        mana_cost: "{1}{U}",
+        cmc: 2,
+        colors: ["U"],
+        color_identity: ["U"],
+        type_line: "Sorcery",
+        rarity: "mythic",
+        layout: "normal",
+        keywords: [],
+        legalities: {
+          standard: "banned"
+        },
+        set: "RSP",
+        collector_number: "2",
+        released_at: "2026-01-01",
+        games: ["arena"]
+      }
+    ]);
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/cards/search?format=standard"
+    });
+
+    expect(response.statusCode).toBe(200);
+    const names = response.json().items.map((item: { name: string }) => item.name);
+    expect(names).toContain("Restricted Probe");
+    expect(names).not.toContain("Banned Probe");
   });
 });

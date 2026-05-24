@@ -4,9 +4,10 @@ import {
   defaultStatsFilters,
   type FilterState,
   type FilterStateUpdater,
-  type MechanicSection
+  type MechanicSection,
+  type StatsDrilldownKind
 } from "../shared/filterState";
-import { StatsBreakdownSection } from "./StatsBreakdownSection";
+import { StatsBreakdownSection, StatsTreeBreakdownSection } from "./StatsBreakdownSection";
 
 type StatsScreenProps = {
   statsState: FilterState;
@@ -20,7 +21,7 @@ type StatsScreenProps = {
   cardStats: CardStatsResponse | null;
   statsLoading: boolean;
   onOpenStatsSearchView: () => void;
-  onOpenStatsDrilldown: (kind: "color" | "manaValue" | "type" | "rarity" | "set" | "mechanic", item: CardStatsResponse["breakdowns"]["colors"][number]) => void;
+  onOpenStatsDrilldown: (kind: StatsDrilldownKind, item: CardStatsResponse["breakdowns"]["colors"][number]) => void;
 };
 
 export function StatsScreen({
@@ -112,6 +113,9 @@ export function StatsScreen({
               </div>
 
               <div className="stats-breakdown-stack">
+                <StatsTreeBreakdownSection title="Type Tree (Type → Subtype / Tribe)" items={cardStats.breakdowns.typeTree} ownedOnly={statsState.ownedOnly} emptyMessage="No type tree data in the current result set." onViewCards={onOpenStatsDrilldown} />
+                <StatsBreakdownSection title="Subtype Breakdown" items={cardStats.breakdowns.subtypes} drilldownKind="subtype" ownedOnly={statsState.ownedOnly} emptyMessage="No subtypes in the current result set." onViewCards={onOpenStatsDrilldown} />
+                <StatsBreakdownSection title="Tribe Breakdown" items={cardStats.breakdowns.tribes} drilldownKind="tribe" ownedOnly={statsState.ownedOnly} emptyMessage="No creature tribes in the current result set." onViewCards={onOpenStatsDrilldown} />
                 <StatsBreakdownSection title="Set Breakdown" items={cardStats.breakdowns.sets} drilldownKind="set" ownedOnly={statsState.ownedOnly} emptyMessage="No sets in the current result set." onViewCards={onOpenStatsDrilldown} />
                 <StatsBreakdownSection title="Mechanic Breakdown" items={cardStats.breakdowns.mechanics} drilldownKind="mechanic" ownedOnly={statsState.ownedOnly} emptyMessage="No mechanics in the current result set." onViewCards={onOpenStatsDrilldown} />
               </div>

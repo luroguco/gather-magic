@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { searchCards } from "../../api";
 import { INITIAL_VISIBLE_RESULTS, buildSearchParams } from "../shared/filterState";
 export const useCardSearch = (filters, onError) => {
@@ -6,24 +6,36 @@ export const useCardSearch = (filters, onError) => {
     const [cardsTotal, setCardsTotal] = useState(0);
     const [visibleResultsCount, setVisibleResultsCount] = useState(INITIAL_VISIBLE_RESULTS);
     const [searchLoading, setSearchLoading] = useState(false);
+    const onErrorRef = useRef(onError);
     useEffect(() => {
+        onErrorRef.current = onError;
+    }, [onError]);
+    useEffect(() => {
+        let active = true;
         const runSearch = async () => {
             try {
                 setSearchLoading(true);
                 const response = await searchCards(buildSearchParams(filters));
-                setCards(response.items);
-                setCardsTotal(response.total);
-                setVisibleResultsCount(Math.min(response.items.length, INITIAL_VISIBLE_RESULTS));
+                if (active) {
+                    setCards(response.items);
+                    setCardsTotal(response.total);
+                    setVisibleResultsCount(Math.min(response.items.length, INITIAL_VISIBLE_RESULTS));
+                }
             }
             catch (error) {
-                onError(error instanceof Error ? error.message : "Card search failed.");
+                onErrorRef.current(error instanceof Error ? error.message : "Card search failed.");
             }
             finally {
-                setSearchLoading(false);
+                if (active) {
+                    setSearchLoading(false);
+                }
             }
         };
         void runSearch();
-    }, [filters, onError]);
+        return () => {
+            active = false;
+        };
+    }, [filters]);
     return {
         cards,
         cardsTotal,

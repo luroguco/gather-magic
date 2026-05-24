@@ -8,6 +8,7 @@ type ScryfallBulkIndex = {
   data: Array<{
     type: string;
     download_uri: string;
+    updated_at?: string | null;
   }>;
 };
 
@@ -66,9 +67,25 @@ type NormalizedCard = {
   releasedAt: string | null;
 };
 
+export type LegalityStatus = "legal" | "not_legal" | "banned" | "restricted";
+
+export type CardDataSyncSource = {
+  source: string;
+  sourceUpdatedAt: string | null;
+  downloadUri: string | null;
+};
+
+export type CardDataSyncMetadata = CardDataSyncSource & {
+  syncedAt: string;
+  cardCount: number;
+  printCount: number;
+};
+
 const SCRYFALL_BULK_INDEX_URL = "https://api.scryfall.com/bulk-data";
 const MTGJSON_ALL_IDENTIFIERS_URL = "https://mtgjson.com/api/v5/AllIdentifiers.json.gz";
 const MTGJSON_SET_BASE_URL = "https://mtgjson.com/api/v5";
+const SCRYFALL_DEFAULT_CARDS_SOURCE = "scryfall-default-cards";
+const LEGALITY_STATUSES = new Set<string>(["legal", "not_legal", "banned", "restricted"]);
 
 type MtgJsonIdentifiers = {
   mtgArenaId?: string;
@@ -96,6 +113,20 @@ export type MtgJsonAllIdentifiers = {
 
 const normalizeName = (value: string) => value.trim().toLowerCase().replace(/\s+/g, " ");
 
+export const normalizeLegalities = (legalities: Record<string, string> | null | undefined) => {
+  const normalized: Record<string, LegalityStatus> = {};
+
+  for (const [format, status] of Object.entries(legalities ?? {})) {
+    normalized[format] = LEGALITY_STATUSES.has(status) ? (status as LegalityStatus) : "not_legal";
+  }
+
+  for (const format of ARENA_FORMATS) {
+    normalized[format] ??= "not_legal";
+  }
+
+  return normalized;
+};
+
 const getImageUrl = (card: ScryfallCard) =>
   card.image_uris?.normal ??
   card.image_uris?.large ??
@@ -103,10 +134,112 @@ const getImageUrl = (card: ScryfallCard) =>
   card.card_faces?.[0]?.image_uris?.large ??
   null;
 
+const readJsonArrayStream = async <T>(stream: ReadableStream<Uint8Array>) => {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  const items: T[] = [];
+  let startedArray = false;
+  let doneArray = false;
+  let depth = 0;
+  let buffer = "";
+  let inString = false;
+  let escaped = false;
+
+  const readText = async (text: string) => {
+    for (const char of text) {
+      if (doneArray) {
+        if (!/\s/.test(char)) {
+          throw new Error("Unexpected content after JSON array");
+        }
+        continue;
+      }
+
+      if (!startedArray) {
+        if (/\s/.test(char)) {
+          continue;
+        }
+        if (char !== "[") {
+          throw new Error("Expected JSON array");
+        }
+        startedArray = true;
+        continue;
+      }
+
+      if (depth === 0) {
+        if (/\s/.test(char) || char === ",") {
+          continue;
+        }
+        if (char === "]") {
+          doneArray = true;
+          continue;
+        }
+        if (char !== "{") {
+          throw new Error("Expected JSON object in array");
+        }
+        buffer = char;
+        depth = 1;
+        inString = false;
+        escaped = false;
+        continue;
+      }
+
+      buffer += char;
+
+      if (inString) {
+        if (escaped) {
+          escaped = false;
+        } else if (char === "\\") {
+          escaped = true;
+        } else if (char === "\"") {
+          inString = false;
+        }
+        continue;
+      }
+
+      if (char === "\"") {
+        inString = true;
+        continue;
+      }
+
+      if (char === "{" || char === "[") {
+        depth += 1;
+        continue;
+      }
+
+      if (char === "}" || char === "]") {
+        depth -= 1;
+        if (depth === 0) {
+          items.push(JSON.parse(buffer) as T);
+          buffer = "";
+        }
+      }
+    }
+  };
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) {
+      break;
+    }
+    await readText(decoder.decode(value, { stream: true }));
+  }
+
+  const finalText = decoder.decode();
+  if (finalText) {
+    await readText(finalText);
+  }
+
+  if (!startedArray || !doneArray || depth !== 0 || inString) {
+    throw new Error("Incomplete JSON array from bulk data stream");
+  }
+
+  return items;
+};
+
 const isArenaPlayableCard = (card: ScryfallCard) => {
   const hasArenaGame = card.games?.includes("arena") ?? false;
   const hasArenaId = typeof card.arena_id === "number";
-  const legalities = card.legalities ?? {};
+  const legalities = normalizeLegalities(card.legalities);
   const hasArenaFormatLegality = ARENA_FORMATS.some((format) => legalities[format] !== "not_legal");
   return hasArenaGame || hasArenaId || hasArenaFormatLegality;
 };
@@ -242,7 +375,8 @@ export const supplementArenaIdsFromMtgJson = (
 export const syncCardsFromBulkData = (
   db: DbHandle,
   cards: ScryfallCard[],
-  mtgJsonIdentifiers?: MtgJsonAllIdentifiers
+  mtgJsonIdentifiers?: MtgJsonAllIdentifiers,
+  syncSource?: CardDataSyncSource
 ) => {
   const grouped = new Map<string, NormalizedCard>();
   const seenArenaIds = new Set<number>();
@@ -285,7 +419,7 @@ export const syncCardsFromBulkData = (
         rarity: card.rarity ?? "",
         layout: card.layout ?? "",
         keywords: Array.from(card.keywords ?? []),
-        legalities: card.legalities ?? {},
+        legalities: normalizeLegalities(card.legalities),
         prints: [print],
         imageUrl: print.imageUrl,
         preferredSetCode: print.setCode,
@@ -303,7 +437,7 @@ export const syncCardsFromBulkData = (
     existing.releasedAt = preferredPrint.releasedAt;
   }
 
-  const replaceAll = db.transaction((normalizedCards: NormalizedCard[]) => {
+  const replaceAll = db.transaction((normalizedCards: NormalizedCard[], syncMetadata?: CardDataSyncMetadata) => {
     const upsertCard = db.prepare(`
       INSERT INTO cards (
         id, oracle_id, name, normalized_name, oracle_text, mana_cost, mana_value,
@@ -364,6 +498,19 @@ export const syncCardsFromBulkData = (
       INSERT INTO card_mechanics (card_id, tag_slug, tag_label, tag_type, source_rule)
       VALUES (@cardId, @slug, @label, @type, @sourceRule)
     `);
+    const upsertCardDataSync = db.prepare(`
+      INSERT INTO card_data_syncs (
+        source, source_updated_at, download_uri, synced_at, card_count, print_count
+      ) VALUES (
+        @source, @sourceUpdatedAt, @downloadUri, @syncedAt, @cardCount, @printCount
+      )
+      ON CONFLICT(source) DO UPDATE SET
+        source_updated_at = excluded.source_updated_at,
+        download_uri = excluded.download_uri,
+        synced_at = excluded.synced_at,
+        card_count = excluded.card_count,
+        print_count = excluded.print_count
+    `);
 
     for (const card of normalizedCards) {
       upsertCard.run({
@@ -409,16 +556,31 @@ export const syncCardsFromBulkData = (
         });
       }
     }
+
+    if (syncMetadata) {
+      upsertCardDataSync.run(syncMetadata);
+    }
   });
 
   const normalizedCards = [...grouped.values()];
   const mtgJsonSupplement = mtgJsonIdentifiers
     ? supplementArenaIdsFromMtgJson(normalizedCards, mtgJsonIdentifiers)
     : null;
-  replaceAll(normalizedCards);
+  const cardCount = normalizedCards.length;
+  const printCount = normalizedCards.reduce((count, card) => count + card.prints.length, 0);
+  const syncMetadata = syncSource
+    ? {
+        ...syncSource,
+        syncedAt: new Date().toISOString(),
+        cardCount,
+        printCount
+      }
+    : undefined;
+  replaceAll(normalizedCards, syncMetadata);
   return {
-    cardCount: normalizedCards.length,
-    printCount: normalizedCards.reduce((count, card) => count + card.prints.length, 0),
+    cardCount,
+    printCount,
+    syncMetadata,
     supplementedArenaIdCount: mtgJsonSupplement?.supplementedPrints ?? 0,
     supplementedArenaIdByScryfallIdCount: mtgJsonSupplement?.matchedByScryfallId ?? 0,
     supplementedArenaIdBySetCollectorCount: mtgJsonSupplement?.matchedBySetAndCollectorNumber ?? 0,
@@ -427,7 +589,24 @@ export const syncCardsFromBulkData = (
 };
 
 export const fetchBulkData = async (customDownloadUri?: string): Promise<ScryfallCard[]> => {
-  const downloadUri = customDownloadUri ?? (await fetchBulkDownloadUri());
+  const { cards } = await fetchBulkDataWithMetadata(customDownloadUri);
+  return cards;
+};
+
+export const fetchBulkDataWithMetadata = async (
+  customDownloadUri?: string
+): Promise<{ cards: ScryfallCard[]; source: CardDataSyncSource }> => {
+  const source = customDownloadUri
+    ? {
+        source: SCRYFALL_DEFAULT_CARDS_SOURCE,
+        sourceUpdatedAt: null,
+        downloadUri: customDownloadUri
+      }
+    : await fetchBulkDownloadSource();
+  const downloadUri = source.downloadUri;
+  if (!downloadUri) {
+    throw new Error("Scryfall bulk data source did not include a download URI");
+  }
   const response = await fetch(downloadUri, {
     headers: {
       "User-Agent": "mtga-collection-explorer/0.1",
@@ -438,11 +617,17 @@ export const fetchBulkData = async (customDownloadUri?: string): Promise<Scryfal
   if (!response.ok) {
     throw new Error(`Failed to download Scryfall bulk cards: ${response.status} ${response.statusText}`);
   }
+  if (!response.body) {
+    throw new Error("Scryfall bulk cards response did not include a body");
+  }
 
-  return (await response.json()) as ScryfallCard[];
+  return {
+    cards: await readJsonArrayStream<ScryfallCard>(response.body),
+    source
+  };
 };
 
-const fetchBulkDownloadUri = async () => {
+const fetchBulkDownloadSource = async (): Promise<CardDataSyncSource> => {
   const response = await fetch(SCRYFALL_BULK_INDEX_URL, {
     headers: {
       "User-Agent": "mtga-collection-explorer/0.1",
@@ -459,7 +644,11 @@ const fetchBulkDownloadUri = async () => {
   if (!defaultCards) {
     throw new Error("Scryfall bulk index did not include default_cards");
   }
-  return defaultCards.download_uri;
+  return {
+    source: SCRYFALL_DEFAULT_CARDS_SOURCE,
+    sourceUpdatedAt: defaultCards.updated_at ?? null,
+    downloadUri: defaultCards.download_uri
+  };
 };
 
 export const fetchMtgJsonAllIdentifiers = async (
