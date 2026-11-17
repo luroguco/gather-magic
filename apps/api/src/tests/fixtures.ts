@@ -180,10 +180,13 @@ export const untappedCollectionJson = JSON.stringify(
 export const collectorSnapshotJson = JSON.stringify(
   {
     snapshotVersion: 1,
+    status: "complete",
     capturedAt: "2026-04-03T02:15:00.000Z",
     platform: "darwin",
     collectorVersion: "0.1.0",
     mtgaPid: 11955,
+    entryCount: 3,
+    totalQuantity: 7,
     diagnostics: {
       source: "runtime-direct",
       warnings: ["attach failed"]
@@ -197,3 +200,60 @@ export const collectorSnapshotJson = JSON.stringify(
   null,
   2
 );
+
+export const arenaDeckPlayerLog = [
+  "[UnityCrossThreadLogger] <== StartHook(1)",
+  JSON.stringify({
+    DeckSummaries: [
+      {
+        DeckId: "arena-custom-standard",
+        Name: "Logbook Standard",
+        Attributes: [
+          { name: "Version", value: "4" },
+          { name: "Format", value: "Standard" },
+          { name: "LastUpdated", value: JSON.stringify("2026-07-25T15:00:00-04:00") },
+          { name: "LastPlayed", value: JSON.stringify("2026-07-26T12:30:00-04:00") },
+          { name: "IsFavorite", value: "true" }
+        ]
+      },
+      {
+        DeckId: "arena-custom-limited",
+        Name: "Draft Keeps",
+        Attributes: [
+          { name: "Version", value: "2" },
+          { name: "Format", value: "DirectGameLimited" },
+          { name: "LastUpdated", value: JSON.stringify("2026-07-24T10:00:00-04:00") }
+        ]
+      },
+      {
+        DeckId: "arena-starter",
+        Name: "?=?Loc/Decks/Precon/CC_ANB_W",
+        Attributes: [{ name: "Format", value: "Alchemy" }]
+      }
+    ],
+    Decks: {
+      "arena-custom-standard": {
+        MainDeck: [
+          { cardId: 1001, quantity: 2 },
+          { cardId: 9999, quantity: 1 }
+        ],
+        Sideboard: [{ cardId: 1002, quantity: 1 }],
+        CommandZone: [],
+        Companions: []
+      },
+      "arena-custom-limited": {
+        MainDeck: [{ cardId: 1002, quantity: 40 }],
+        Sideboard: [],
+        CommandZone: [],
+        Companions: []
+      },
+      "arena-starter": {
+        MainDeck: [{ cardId: 1001, quantity: 60 }],
+        Sideboard: [],
+        CommandZone: [],
+        Companions: []
+      }
+    }
+  }),
+  "[UnityCrossThreadLogger] startup complete"
+].join("\n");

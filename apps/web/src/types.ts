@@ -7,6 +7,8 @@ export type ArenaFormat =
   | "brawl"
   | "standardbrawl";
 
+export type DeckFormat = ArenaFormat | "limited" | "other";
+
 export type Mechanic = {
   slug: string;
   label: string;
@@ -42,14 +44,7 @@ export type CardSummary = {
   }>;
 };
 
-export type CardPrint = {
-  printId: string;
-  arenaId: number | null;
-  setCode: string;
-  collectorNumber: string | null;
-  imageUrl: string | null;
-  releasedAt: string | null;
-};
+export type CardPrint = CardPrintDto;
 
 export type CardDetail = CardSummary & {
   prints: CardPrint[];
@@ -123,33 +118,45 @@ export type DeckCard = {
   typeLine?: string;
   manaCost?: string;
   manaValue?: number;
-  ownedCount?: number;
+  ownedCount?: number | null;
 };
 
 export type Deck = {
   id: string;
   name: string;
-  format: ArenaFormat;
+  format: DeckFormat;
   notes: string;
   createdAt: string;
   updatedAt: string;
+  source: "local" | "arena";
+  externalId: string | null;
+  sourceFormat: string | null;
+  sourceUpdatedAt: string | null;
+  lastPlayedAt: string | null;
+  isFavorite: boolean;
   cards: DeckCard[];
 };
 
 export type DeckListItem = {
   id: string;
   name: string;
-  format: ArenaFormat;
+  format: DeckFormat;
   notes: string;
   createdAt: string;
   updatedAt: string;
+  source: "local" | "arena";
+  externalId: string | null;
+  sourceFormat: string | null;
+  sourceUpdatedAt: string | null;
+  lastPlayedAt: string | null;
+  isFavorite: boolean;
   cardRows: number;
   totalCards: number;
 };
 
 export type ValidationResult = {
   deckId: string;
-  format: ArenaFormat;
+  format: DeckFormat;
   issues: string[];
   ownershipGaps: Array<{
     cardId: string;
@@ -158,6 +165,39 @@ export type ValidationResult = {
     owned: number;
     missing: number;
   }>;
+};
+
+export type ArenaDeckSyncSummary = {
+  source: "arena-player-log";
+  logPath: string;
+  logModifiedAt: string;
+  totalDecksFound: number;
+  userDecksFound: number;
+  starterDecksFound: number;
+  includeStarterDecks: boolean;
+  decksIncluded: number;
+  placeholderCardCount: number;
+  unresolvedArenaCardIds: number[];
+  newDecks: number;
+  changedDecks: number;
+  unchangedDecks: number;
+  retainedMissingDecks: number;
+  specialFormatDecks: number;
+  importedAt?: string;
+  decksCreated?: number;
+  decksUpdated?: number;
+  importedDeckIds?: string[];
+};
+
+export type DeckBulkExport = {
+  deckCount: number;
+  decks: Array<{
+    deckId: string;
+    name: string;
+    format: DeckFormat;
+    text: string;
+  }>;
+  text: string;
 };
 
 export type AppStatus = {
@@ -184,12 +224,61 @@ export type AppStatus = {
   };
 };
 
+export type CollectionDiff = {
+  addedTitles: number;
+  removedTitles: number;
+  changedTitles: number;
+  unchangedTitles: number;
+};
+
+export type CollectionCsvRow = {
+  Id: string;
+  Name: string;
+  Set: string;
+  Color: string;
+  Rarity: string;
+  Count: string;
+  PrintCount: string;
+};
+
+export type CollectionCsvPreview = {
+  source: "collection-csv";
+  importedAt?: string;
+  rowsRead: number;
+  cardsMatched: number;
+  ownedTitles: number;
+  ownedCopies: number;
+  rawOwnedCopies: number;
+  unresolvedRows: CollectionCsvRow[];
+  diff: CollectionDiff;
+};
+
+export type CollectionImportHistoryItem = {
+  id: string;
+  source: string;
+  importedAt: string;
+  metadata: Record<string, unknown>;
+  cardEntries: number;
+  ownedCopies: number;
+  rawOwnedCopies: number;
+};
+
+export type CollectionRestoreResult = {
+  id: string;
+  restoredFrom: string;
+  importedAt: string;
+};
+
 export type CollectorSnapshotMetadata = {
   snapshotVersion: number;
+  status?: "complete";
   capturedAt?: string;
   platform?: string;
   collectorVersion?: string;
   mtgaPid?: number;
+  mtgaBuild?: string;
+  entryCount?: number;
+  totalQuantity?: number;
   diagnostics?: {
     source?: string;
     warnings?: string[];
@@ -200,7 +289,7 @@ export type CollectionImportSummary = {
   source: "untapped-json" | "collector-snapshot";
   importedAt?: string;
   extractedPath: string;
-  catalogSource: "database" | "untapped-public";
+  catalogSource: "database" | "untapped-public" | "hybrid";
   snapshotMetadata?: CollectorSnapshotMetadata;
   catalogMetadata?: {
     build?: string | null;
@@ -223,17 +312,13 @@ export type CollectionImportSummary = {
     printCount: number;
     reason: string;
   }>;
-  diff: {
-    addedTitles: number;
-    removedTitles: number;
-    changedTitles: number;
-    unchangedTitles: number;
-  };
+  diff: CollectionDiff;
 };
 
 export type UntappedImportSummary = CollectionImportSummary;
 
 export type CollectorCaptureFile = {
+  id: string;
   path: string;
   filename: string;
   size: number;
@@ -241,7 +326,10 @@ export type CollectorCaptureFile = {
 };
 
 export type CollectorCaptureStatus = {
+  enabled: boolean;
   available: boolean;
+  readyToCapture: boolean;
+  disabledReason?: string;
   snapshotPath: string;
   addonPath: string;
   addonAvailable: boolean;
@@ -250,6 +338,11 @@ export type CollectorCaptureStatus = {
   mtgaRunning: boolean;
   mtgaPid: number | null;
   latestCapture: CollectorCaptureFile | null;
+  lastFailure: {
+    code: string;
+    message: string;
+    occurredAt: string;
+  } | null;
 };
 
 export type CollectorCaptureImportSummary = CollectionImportSummary & {
@@ -257,18 +350,36 @@ export type CollectorCaptureImportSummary = CollectionImportSummary & {
 };
 
 export type UntappedCaptureFile = {
+  id: string;
   path: string;
   filename: string;
   size: number;
   modifiedAt: string;
+  source: "automated" | "download";
 };
 
 export type UntappedCaptureStatus = {
+  enabled: boolean;
   available: boolean;
+  disabledReason?: string;
   configPath: string;
   downloadsPath: string;
   showDevTools: boolean | null;
   latestCapture: UntappedCaptureFile | null;
+  companionInstalled: boolean;
+  companionRunning: boolean;
+  companionPid: number | null;
+  automationState:
+    | "not-installed"
+    | "not-running"
+    | "restart-required"
+    | "connecting"
+    | "ready"
+    | "unavailable";
+  readyToCapture: boolean;
+  restartRequired: boolean;
+  message: string;
+  devToolsPort?: number;
   snippet: string;
 };
 
@@ -285,4 +396,11 @@ export type UntappedCaptureStopResult = {
 
 export type UntappedCaptureImportSummary = UntappedImportSummary & {
   capture: UntappedCaptureFile;
+  catalogSync?: {
+    sourceUpdatedAt: string | null;
+    syncedAt: string | null;
+    cardCount: number;
+    printCount: number;
+  };
 };
+import type { CardPrintDto } from "@mtga/contracts";

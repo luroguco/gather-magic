@@ -6,6 +6,8 @@
   "main": "dist/main.js",
   "scripts": {
     "build": "tsc -p tsconfig.json && cp src/index.html dist/index.html && cp src/renderer.js dist/renderer.js && cp src/uiPreload.cjs dist/uiPreload.cjs && cp src/probePreload.cjs dist/probePreload.cjs",
+    "capture:snapshot": "npm run build && node dist/capture/collectMtgaCollectionSnapshot.js",
+    "dev:watch": "tsc -p tsconfig.json --watch --preserveWatchOutput",
     "dev": "npm run build && npm run start",
     "lint": "tsc -p tsconfig.json --noEmit",
     "package:mac": "npm run build && node dist/packageMac.js",
@@ -13,12 +15,17 @@
     "package:mac:signed": "npm run build && node dist/packageMac.js --sign",
     "probe:packaged": "node dist/runPackagedProbe.js",
     "probe:runtime": "npm run build && env -u ELECTRON_RUN_AS_NODE electron dist/main.js --run-runtime-probe",
-    "start": "env -u ELECTRON_RUN_AS_NODE electron dist/main.js"
+    "start": "env -u ELECTRON_RUN_AS_NODE electron dist/main.js",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@mtga/contracts": "*"
   },
   "devDependencies": {
     "@electron/osx-sign": "^2.3.0",
     "@electron/packager": "^19.1.0",
     "@types/node": "^24.6.0",
-    "electron": "^41.1.0"
+    "electron": "^41.1.0",
+    "vitest": "^3.2.4"
   }
 }

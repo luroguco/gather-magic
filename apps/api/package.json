@@ -5,7 +5,6 @@
   "type": "module",
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "collect:mtga:snapshot": "npm run build && node dist/scripts/collectMtgaCollectionSnapshot.js",
     "collect:mtga:collection-core": "tsx src/scripts/collectMtgaWithLldb.ts --classes CardCollection,CollectionInfo,InventoryManager,SetCollectionController,DeckBuilderModel,DeckBuilderContext,WrapperDeckBuilder --include-fields",
     "collect:mtga:lldb": "tsx src/scripts/collectMtgaWithLldb.ts",
     "compare:collection": "tsx src/scripts/compareCollectionSources.ts",
@@ -26,6 +25,7 @@
     "db:sync": "tsx src/scripts/syncCards.ts"
   },
   "dependencies": {
+    "@mtga/contracts": "*",
     "@fastify/cors": "^11.1.0",
     "@fastify/multipart": "^9.2.1",
     "better-sqlite3": "^12.4.1",

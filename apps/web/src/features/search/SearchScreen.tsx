@@ -55,6 +55,8 @@ type SearchScreenProps = {
   onVisibleResultsCountChange: (updater: (current: number) => number) => void;
   viewMode: ResultsViewMode;
   onViewModeChange: (mode: ResultsViewMode) => void;
+  exportLoading: boolean;
+  onExportSearch: () => void;
   visibleCards: CardSummary[];
   visibleSortedCards: CardSummary[];
   onClearDrilldown: () => void;
@@ -85,6 +87,8 @@ export function SearchScreen({
   onVisibleResultsCountChange,
   viewMode,
   onViewModeChange,
+  exportLoading,
+  onExportSearch,
   visibleCards,
   visibleSortedCards,
   onClearDrilldown,
@@ -142,12 +146,22 @@ export function SearchScreen({
               {searchLoading ? "Searching..." : `Showing ${Math.min(visibleResultsCount, cards.length)} of ${cardsTotal} matches`}
             </span>
           </div>
-          <div className="view-toggle">
-            {(["grid", "list", "table"] as ResultsViewMode[]).map((mode) => (
-              <button className={viewMode === mode ? "view-button active" : "view-button"} key={mode} onClick={() => onViewModeChange(mode)} type="button">
-                {mode.charAt(0).toUpperCase() + mode.slice(1)}
-              </button>
-            ))}
+          <div className="search-header-actions">
+            <div className="view-toggle">
+              {(["grid", "list", "table"] as ResultsViewMode[]).map((mode) => (
+                <button className={viewMode === mode ? "view-button active" : "view-button"} key={mode} onClick={() => onViewModeChange(mode)} type="button">
+                  {mode.charAt(0).toUpperCase() + mode.slice(1)}
+                </button>
+              ))}
+            </div>
+            <button
+              className="ghost-button subtle-button"
+              disabled={searchLoading || exportLoading || cards.length === 0}
+              onClick={onExportSearch}
+              type="button"
+            >
+              {exportLoading ? "Exporting..." : "Export CSV"}
+            </button>
           </div>
         </div>
 

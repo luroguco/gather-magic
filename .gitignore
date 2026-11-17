@@ -7,6 +7,9 @@ apps/collector/out
 coverage
 .DS_Store
 *.log
+*.tsbuildinfo
+apps/web/src/**/*.js
+apps/web/src/**/*.d.ts
 data/
 !data/.gitkeep
 Kodo Collection.csv

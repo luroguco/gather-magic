@@ -1,11 +1,6 @@
 import { createDatabase } from "../lib/database.js";
 import {
-  collectArenaRelevantSetCodes,
-  fetchBulkDataWithMetadata,
-  fetchMtgJsonSetIdentifiersForCards,
-  readBulkDataFromFile,
-  readMtgJsonAllIdentifiersFromFile,
-  syncCardsFromBulkData
+  syncCardCatalog
 } from "../services/cardData.js";
 
 const db = createDatabase();
@@ -56,25 +51,7 @@ const parseArgs = (argv: string[]): CliOptions => {
 
 const run = async () => {
   const options = parseArgs(process.argv.slice(2));
-  const bulkData = options.scryfallFile
-    ? {
-        cards: await readBulkDataFromFile(options.scryfallFile),
-        source: {
-          source: "scryfall-default-cards",
-          sourceUpdatedAt: null,
-          downloadUri: options.scryfallFile
-        }
-      }
-    : await fetchBulkDataWithMetadata();
-  const cards = bulkData.cards;
-  const mtgJsonSetCodes = options.skipMtgJson ? [] : collectArenaRelevantSetCodes(cards);
-  const mtgJsonIdentifiers = options.skipMtgJson
-    ? undefined
-    : options.mtgJsonFile
-      ? await readMtgJsonAllIdentifiersFromFile(options.mtgJsonFile)
-      : await fetchMtgJsonSetIdentifiersForCards(cards);
-
-  const result = syncCardsFromBulkData(db, cards, mtgJsonIdentifiers, bulkData.source);
+  const result = await syncCardCatalog(db, options);
   console.log(`Synced ${result.cardCount} cards across ${result.printCount} Arena printings.`);
   if (result.syncMetadata) {
     console.log(
@@ -82,7 +59,7 @@ const run = async () => {
     );
   }
   if (!options.skipMtgJson) {
-    console.log(`Fetched MTGJSON set supplements for ${mtgJsonSetCodes.length} Arena-relevant set codes.`);
+    console.log(`Fetched MTGJSON set supplements for ${result.mtgJsonSetCount} Arena-relevant set codes.`);
     console.log(
       `Supplemented ${result.supplementedArenaIdCount} missing Arena ids from MTGJSON (${result.supplementedArenaIdByScryfallIdCount} by Scryfall id, ${result.supplementedArenaIdBySetCollectorCount} by set/collector, ${result.skippedConflictingArenaIdCount} skipped conflicts).`
     );

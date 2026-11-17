@@ -11,10 +11,13 @@ import {
   VerticalColorStrip
 } from "./cardPresentation";
 import {
+  capturePreviewUntappedCollection,
   capturePreviewCollectorSnapshot,
   createDeck,
+  exportAllDecks,
   exportDeck,
   getCard,
+  getCollectionImportHistory,
   getCollectorHelperStatus,
   importCollectorSnapshot,
   getDeck,
@@ -25,26 +28,38 @@ import {
   importUntappedCollection,
   importLatestUntappedCapture,
   listDecks,
+  previewArenaDeckSync,
   previewLatestCollectorSnapshot,
+  previewCollectionCsv,
   previewCollectorSnapshot,
   previewUntappedCollection,
   previewLatestUntappedCapture,
+  restartUntappedCompanion,
+  searchCards,
   startUntappedHelper,
   stopUntappedHelper,
+  restoreCollectionImport,
+  syncArenaDecks,
   updateDeck,
   uploadCollection,
   validateDeck
 } from "./api";
 import { DeckDisplayControls } from "./features/decks/DeckDisplayControls";
 import { DecksScreen } from "./features/decks/DecksScreen";
+import { useDeckWorkspace } from "./features/decks/useDeckWorkspace";
+import { CoachScreen, type CoachSavePayload } from "./features/coach/CoachScreen";
 import { ImportScreen } from "./features/import/ImportScreen";
+import { useImportWorkflow } from "./features/import/useImportWorkflow";
 import { useUntappedGuidePolling } from "./features/import/useUntappedGuidePolling";
+import { buildCardSearchCsv, downloadCsvFile } from "./features/search/exportCards";
 import { SearchScreen } from "./features/search/SearchScreen";
 import { useCardSearch } from "./features/search/useCardSearch";
 import {
   CARD_TYPES,
+  buildSearchParams,
   clearDrilldownState,
   defaultSearch,
+  DECK_FORMATS,
   FORMATS,
   ResultsViewMode,
   groupDerivedMechanics,
@@ -59,20 +74,19 @@ import { StatsScreen } from "./features/stats/StatsScreen";
 import { useCardStats } from "./features/stats/useCardStats";
 import type {
   AppStatus,
+  ArenaDeckSyncSummary,
   CardDetail,
   CardSummary,
+  CollectionImportHistoryItem,
   CollectionImportSummary,
   CollectorCaptureImportSummary,
   CollectorCaptureStatus,
   Deck,
   DeckCard,
-  DeckListItem,
   StatsBreakdownItem,
   UntappedCaptureFile,
-  UntappedCaptureStatus,
   Mechanic,
-  UntappedImportSummary,
-  ValidationResult
+  UntappedImportSummary
 } from "./types";
 
 const FAVORITES_STORAGE_KEY = "mtga.favorite-mechanics";
@@ -102,8 +116,6 @@ const UNTAPPED_CAPTURE_SNIPPET = `(async () => {
   URL.revokeObjectURL(url);
 })();`;
 type AppTheme = (typeof THEME_OPTIONS)[number]["value"];
-type DeckSortKey = "added" | "name" | "manaValue" | "typeLine" | "quantity";
-type DeckGroupKey = "none" | "section" | "typeLine" | "manaValue";
 type TableSortKey =
   | "name"
   | "colors"
@@ -135,33 +147,6 @@ const mergeDeckCard = (
 const formatDateTime = (value: string | null) =>
   value ? new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(new Date(value)) : "Never";
 
-const formatCatalogLabel = (preview: CollectionImportSummary | null) => {
-  if (!preview) {
-    return "Pending preview";
-  }
-
-  if (preview.catalogSource === "database") {
-    return "Local catalog";
-  }
-
-  const buildLabel = preview.catalogMetadata?.build ? ` build ${preview.catalogMetadata.build}` : "";
-  return `Untapped public${buildLabel}`;
-};
-
-const formatImportPreviewContext = (preview: CollectionImportSummary) => {
-  const parts = [formatCatalogLabel(preview)];
-
-  if (preview.snapshotMetadata?.capturedAt) {
-    parts.push(`Captured ${formatDateTime(preview.snapshotMetadata.capturedAt)}`);
-  }
-
-  if (preview.snapshotMetadata?.collectorVersion) {
-    parts.push(`Collector ${preview.snapshotMetadata.collectorVersion}`);
-  }
-
-  return parts.join(" · ");
-};
-
 const formatOwnedCount = (card: CardSummary) => {
   if (card.rawOwnedCount <= 0) {
     return "0 owned";
@@ -175,7 +160,7 @@ const formatOwnedCount = (card: CardSummary) => {
 const compareText = (left: string, right: string) => left.localeCompare(right);
 const compareNumber = (left: number, right: number) => left - right;
 const getFormatLabel = (format: Deck["format"]) =>
-  FORMATS.find(([value]) => value === format)?.[1] ?? format;
+  DECK_FORMATS.find(([value]) => value === format)?.[1] ?? format;
 const truncateDeckName = (name: string, max = 16) =>
   name.length <= max ? name : `${name.slice(0, Math.max(1, max - 3))}...`;
 const getDeckTypeBucket = (typeLine: string) =>
@@ -183,21 +168,23 @@ const getDeckTypeBucket = (typeLine: string) =>
 const getUntappedSearchUrl = (cardName: string) =>
   `https://duckduckgo.com/?q=${encodeURIComponent(`site:mtga.untapped.gg/meta/cards "${cardName}"`)}`;
 
-type PendingAdd = {
-  card: CardSummary;
-  section: DeckCard["section"];
-};
-
-type CollectorPreviewSource = "manual-file" | "latest-capture";
-type UntappedPreviewSource = "manual-file" | "latest-capture";
-
 const formatFileSize = (size: number) =>
   size >= 1024 ? `${(size / 1024).toFixed(1)} KB` : `${size} B`;
+
+const downloadTextFile = (filename: string, text: string) => {
+  const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  link.click();
+  URL.revokeObjectURL(url);
+};
 
 const getCollectorCaptureIdentity = (capture: CollectorCaptureStatus["latestCapture"] | null) =>
   capture ? `${capture.path}::${capture.modifiedAt}` : null;
 const getUntappedCaptureIdentity = (capture: UntappedCaptureFile | null) =>
-  capture ? `${capture.path}::${capture.modifiedAt}` : null;
+  capture?.id ?? null;
 
 function App() {
   const [status, setStatus] = useState<AppStatus | null>(null);
@@ -214,44 +201,105 @@ function App() {
     openStatsSearchView,
     openStatsDrilldown
   } = useSyncedCardFilters();
-  const [deckList, setDeckList] = useState<DeckListItem[]>([]);
-  const [activeDeck, setActiveDeck] = useState<Deck | null>(null);
-  const [validation, setValidation] = useState<ValidationResult | null>(null);
-  const [exportText, setExportText] = useState("");
-  const [activeTab, setActiveTab] = useState<"search" | "stats" | "decks" | "import">("search");
-  const [deckName, setDeckName] = useState("New Arena Deck");
-  const [deckFormat, setDeckFormat] = useState<Deck["format"]>("standard");
-  const [quickDeckName, setQuickDeckName] = useState("Search Deck");
-  const [quickDeckFormat, setQuickDeckFormat] = useState<Deck["format"]>("standard");
+  const {
+    deckList,
+    setDeckList,
+    activeDeck,
+    setActiveDeck,
+    validation,
+    setValidation,
+    exportText,
+    setExportText,
+    deckName,
+    setDeckName,
+    deckFormat,
+    setDeckFormat,
+    quickDeckName,
+    setQuickDeckName,
+    quickDeckFormat,
+    setQuickDeckFormat,
+    deckDrawerOpen,
+    setDeckDrawerOpen,
+    pendingAdd,
+    setPendingAdd,
+    deckTargetMenuOpen,
+    setDeckTargetMenuOpen,
+    drawerCreateMode,
+    setDrawerCreateMode,
+    deckSort,
+    setDeckSort,
+    deckGroup,
+    setDeckGroup
+  } = useDeckWorkspace();
+  const [activeTab, setActiveTab] = useState<
+    "search" | "coach" | "stats" | "decks" | "import"
+  >("search");
   const [importMessage, setImportMessage] = useState("");
   const [errorMessage, setErrorMessage] = useState("");
-  const [collectorSnapshotFile, setCollectorSnapshotFile] = useState<File | null>(null);
-  const [collectorSnapshotPreview, setCollectorSnapshotPreview] = useState<CollectionImportSummary | CollectorCaptureImportSummary | null>(null);
-  const [collectorSnapshotPreviewLoading, setCollectorSnapshotPreviewLoading] = useState(false);
-  const [collectorSnapshotImporting, setCollectorSnapshotImporting] = useState(false);
-  const [collectorHelperStatus, setCollectorHelperStatus] = useState<CollectorCaptureStatus | null>(null);
-  const [collectorHelperLoading, setCollectorHelperLoading] = useState(false);
-  const [collectorPreviewSource, setCollectorPreviewSource] = useState<CollectorPreviewSource | null>(null);
-  const [untappedFile, setUntappedFile] = useState<File | null>(null);
-  const [untappedPreview, setUntappedPreview] = useState<UntappedImportSummary | null>(null);
-  const [untappedPreviewLoading, setUntappedPreviewLoading] = useState(false);
-  const [untappedImporting, setUntappedImporting] = useState(false);
-  const [untappedHelperStatus, setUntappedHelperStatus] = useState<UntappedCaptureStatus | null>(null);
-  const [untappedHelperLoading, setUntappedHelperLoading] = useState(false);
-  const [untappedGuideActive, setUntappedGuideActive] = useState(false);
-  const [untappedPreviewSource, setUntappedPreviewSource] = useState<UntappedPreviewSource | null>(null);
-  const [lastAutoPreviewedCaptureId, setLastAutoPreviewedCaptureId] = useState<string | null>(null);
+  const [arenaDeckPreview, setArenaDeckPreview] =
+    useState<ArenaDeckSyncSummary | null>(null);
+  const [arenaDeckPreviewLoading, setArenaDeckPreviewLoading] = useState(false);
+  const [arenaDeckSyncing, setArenaDeckSyncing] = useState(false);
+  const [includeStarterDecks, setIncludeStarterDecks] = useState(false);
+  const [bulkDeckExportLoading, setBulkDeckExportLoading] = useState(false);
+  const [bulkDeckExportStatus, setBulkDeckExportStatus] = useState<
+    "idle" | "copied" | "downloaded"
+  >("idle");
+  const {
+    csvFile,
+    setCsvFile,
+    csvPreview,
+    setCsvPreview,
+    csvPreviewLoading,
+    setCsvPreviewLoading,
+    csvImporting,
+    setCsvImporting,
+    collectorSnapshotFile,
+    setCollectorSnapshotFile,
+    collectorSnapshotPreview,
+    setCollectorSnapshotPreview,
+    collectorSnapshotPreviewLoading,
+    setCollectorSnapshotPreviewLoading,
+    collectorSnapshotImporting,
+    setCollectorSnapshotImporting,
+    collectorHelperStatus,
+    setCollectorHelperStatus,
+    collectorHelperLoading,
+    setCollectorHelperLoading,
+    collectorStatusRefreshing,
+    setCollectorStatusRefreshing,
+    collectorPreviewSource,
+    setCollectorPreviewSource,
+    collectorSnapshotError,
+    setCollectorSnapshotError,
+    untappedFile,
+    setUntappedFile,
+    untappedPreview,
+    setUntappedPreview,
+    untappedPreviewLoading,
+    setUntappedPreviewLoading,
+    untappedImporting,
+    setUntappedImporting,
+    untappedHelperStatus,
+    setUntappedHelperStatus,
+    untappedHelperLoading,
+    setUntappedHelperLoading,
+    untappedGuideActive,
+    setUntappedGuideActive,
+    untappedPreviewSource,
+    setUntappedPreviewSource,
+    lastAutoPreviewedCaptureId,
+    setLastAutoPreviewedCaptureId
+  } = useImportWorkflow();
+  const [importHistory, setImportHistory] = useState<CollectionImportHistoryItem[]>([]);
+  const [importHistoryLoading, setImportHistoryLoading] = useState(false);
+  const [restoringImportId, setRestoringImportId] = useState<string | null>(null);
   const [glossaryOpen, setGlossaryOpen] = useState(false);
   const [glossaryQuery, setGlossaryQuery] = useState("");
-  const [deckDrawerOpen, setDeckDrawerOpen] = useState(false);
-  const [pendingAdd, setPendingAdd] = useState<PendingAdd | null>(null);
   const [filtersCollapsed, setFiltersCollapsed] = useState(false);
-  const [deckTargetMenuOpen, setDeckTargetMenuOpen] = useState(false);
-  const [drawerCreateMode, setDrawerCreateMode] = useState(false);
   const [cardDetail, setCardDetail] = useState<CardDetail | null>(null);
   const [cardDetailLoading, setCardDetailLoading] = useState(false);
-  const [deckSort, setDeckSort] = useState<DeckSortKey>("added");
-  const [deckGroup, setDeckGroup] = useState<DeckGroupKey>("section");
+  const [searchExportLoading, setSearchExportLoading] = useState(false);
   const [theme, setTheme] = useState<AppTheme>(() => {
     if (typeof window === "undefined") {
       return "forest";
@@ -321,6 +369,31 @@ function App() {
     return nextStatus;
   };
 
+  const handleRefreshCollectorStatus = async () => {
+    try {
+      setCollectorStatusRefreshing(true);
+      setCollectorSnapshotError("");
+      await refreshCollectorHelperStatus();
+    } catch (error) {
+      setCollectorSnapshotError(
+        error instanceof Error ? error.message : "Failed to check for MTG Arena."
+      );
+    } finally {
+      setCollectorStatusRefreshing(false);
+    }
+  };
+
+  const refreshImportHistory = async () => {
+    setImportHistoryLoading(true);
+    try {
+      const items = await getCollectionImportHistory();
+      setImportHistory(items);
+      return items;
+    } finally {
+      setImportHistoryLoading(false);
+    }
+  };
+
   const copyUntappedSnippetToClipboard = async (snippet: string) => {
     if (typeof navigator === "undefined" || !navigator.clipboard?.writeText) {
       return false;
@@ -335,7 +408,7 @@ function App() {
   };
 
   const refreshCollectionViewsAfterImport = async () => {
-    await loadStatus();
+    await Promise.all([loadStatus(), loadDecks(activeDeck?.id)]);
     startTransition(() => {
       setSearchState((current) => ({ ...current }));
       setStatsState((current) => ({ ...current }));
@@ -347,10 +420,17 @@ function App() {
     setDeckList(decks);
     const targetDeckId = selectDeckId ?? activeDeck?.id ?? decks[0]?.id;
     if (targetDeckId) {
-      const deck = await getDeck(targetDeckId);
+      const [deck, arenaExport] = await Promise.all([
+        getDeck(targetDeckId),
+        exportDeck(targetDeckId)
+      ]);
       setActiveDeck(deck);
+      setValidation(null);
+      setExportText(arenaExport.text);
     } else {
       setActiveDeck(null);
+      setValidation(null);
+      setExportText("");
     }
   };
 
@@ -433,13 +513,63 @@ function App() {
       return;
     }
 
-    void Promise.all([refreshUntappedHelperStatus(), refreshCollectorHelperStatus()]).catch((error) => {
-      setErrorMessage(error instanceof Error ? error.message : "Failed to load import helper status.");
+    void refreshCollectorHelperStatus().catch((error) => {
+      setCollectorSnapshotError(
+        error instanceof Error ? error.message : "Failed to check direct Arena import."
+      );
+    });
+    void refreshUntappedHelperStatus().catch((error) => {
+      setErrorMessage(
+        error instanceof Error ? error.message : "Failed to check Untapped Companion."
+      );
+    });
+    void refreshImportHistory().catch((error) => {
+      setErrorMessage(
+        error instanceof Error ? error.message : "Failed to load collection update history."
+      );
     });
   }, [activeTab]);
 
-  useUntappedGuidePolling({
+  useEffect(() => {
+    if (activeTab !== "import" || typeof window === "undefined") {
+      return;
+    }
+
+    const intervalId = window.setInterval(() => {
+      if (
+        collectorHelperLoading ||
+        collectorStatusRefreshing ||
+        collectorSnapshotPreviewLoading ||
+        collectorSnapshotImporting
+      ) {
+        return;
+      }
+      void refreshCollectorHelperStatus().catch(() => undefined);
+      if (
+        !untappedGuideActive &&
+        !untappedHelperLoading &&
+        !untappedPreviewLoading &&
+        !untappedImporting
+      ) {
+        void refreshUntappedHelperStatus().catch(() => undefined);
+      }
+    }, 4_000);
+
+    return () => window.clearInterval(intervalId);
+  }, [
     activeTab,
+    collectorHelperLoading,
+    collectorSnapshotImporting,
+    collectorSnapshotPreviewLoading,
+    collectorStatusRefreshing,
+    untappedGuideActive,
+    untappedHelperLoading,
+    untappedImporting,
+    untappedPreviewLoading
+  ]);
+
+  useUntappedGuidePolling({
+    activeTab: activeTab === "coach" ? "search" : activeTab,
     untappedGuideActive,
     lastAutoPreviewedCaptureId,
     setUntappedHelperStatus,
@@ -489,6 +619,102 @@ function App() {
       switchTab("decks");
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : "Failed to create deck.");
+    }
+  };
+
+  const handleSaveCoachDeck = async (
+    payload: CoachSavePayload,
+    options: { deckId: string | null; openEditor: boolean }
+  ) => {
+    const saved = options.deckId
+      ? await updateDeck(options.deckId, payload)
+      : await createDeck(payload);
+    await loadDecks(saved.id);
+    setValidation(await validateDeck(saved.id));
+    setExportText((await exportDeck(saved.id)).text);
+    if (options.openEditor) {
+      switchTab("decks");
+    }
+    return saved.id;
+  };
+
+  const handlePreviewArenaDecks = async () => {
+    try {
+      setArenaDeckPreviewLoading(true);
+      setErrorMessage("");
+      setImportMessage("");
+      setArenaDeckPreview(await previewArenaDeckSync(includeStarterDecks));
+    } catch (error) {
+      setArenaDeckPreview(null);
+      setErrorMessage(
+        error instanceof Error ? error.message : "Failed to read saved Arena decks."
+      );
+    } finally {
+      setArenaDeckPreviewLoading(false);
+    }
+  };
+
+  const handleSyncArenaDecks = async () => {
+    try {
+      setArenaDeckSyncing(true);
+      setErrorMessage("");
+      const result = await syncArenaDecks(includeStarterDecks);
+      const targetDeckId = result.importedDeckIds?.[0];
+      await loadDecks(targetDeckId);
+      if (targetDeckId) {
+        setValidation(await validateDeck(targetDeckId));
+        setExportText((await exportDeck(targetDeckId)).text);
+      }
+      setArenaDeckPreview(await previewArenaDeckSync(includeStarterDecks));
+      const changed = (result.decksCreated ?? 0) + (result.decksUpdated ?? 0);
+      setImportMessage(
+        changed > 0
+          ? `Synced ${changed} Arena deck${changed === 1 ? "" : "s"} without changing local-only decks.`
+          : "Your Arena decks are already up to date."
+      );
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error ? error.message : "Failed to sync saved Arena decks."
+      );
+    } finally {
+      setArenaDeckSyncing(false);
+    }
+  };
+
+  const handleCopyAllDecks = async () => {
+    try {
+      setBulkDeckExportLoading(true);
+      setBulkDeckExportStatus("idle");
+      setErrorMessage("");
+      const bundle = await exportAllDecks();
+      await navigator.clipboard.writeText(bundle.text);
+      setBulkDeckExportStatus("copied");
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error ? error.message : "Failed to copy the deck bundle."
+      );
+    } finally {
+      setBulkDeckExportLoading(false);
+    }
+  };
+
+  const handleDownloadAllDecks = async () => {
+    try {
+      setBulkDeckExportLoading(true);
+      setBulkDeckExportStatus("idle");
+      setErrorMessage("");
+      const bundle = await exportAllDecks();
+      downloadTextFile(
+        `mtga-decks-${new Date().toISOString().slice(0, 10)}.txt`,
+        bundle.text
+      );
+      setBulkDeckExportStatus("downloaded");
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error ? error.message : "Failed to download the deck bundle."
+      );
+    } finally {
+      setBulkDeckExportLoading(false);
     }
   };
 
@@ -552,21 +778,51 @@ function App() {
     }
   };
 
-  const handleImport = async (event: React.ChangeEvent<HTMLInputElement>) => {
+  const handleCsvPreview = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
+    event.target.value = "";
     if (!file) {
       return;
     }
 
     try {
-      const result = await uploadCollection(file);
+      setErrorMessage("");
+      setImportMessage("");
+      setCsvFile(file);
+      setCsvPreview(null);
+      setCsvPreviewLoading(true);
+      const preview = await previewCollectionCsv(file);
+      setCsvPreview(preview);
+      setImportMessage(`Reviewed ${file.name}. Nothing has been replaced yet.`);
+    } catch (error) {
+      setCsvFile(null);
+      setCsvPreview(null);
+      setErrorMessage(error instanceof Error ? error.message : "Collection CSV preview failed.");
+    } finally {
+      setCsvPreviewLoading(false);
+    }
+  };
+
+  const handleConfirmCsvImport = async (confirmSuspiciousDiff: boolean) => {
+    if (!csvFile) {
+      return;
+    }
+
+    try {
+      setErrorMessage("");
+      setImportMessage("");
+      setCsvImporting(true);
+      const result = await uploadCollection(csvFile, confirmSuspiciousDiff);
+      setCsvPreview(result);
       setImportMessage(
-        `Imported ${result.ownedCopies} owned copies across ${result.cardsMatched} cards. ` +
-          `${result.unresolvedRows.length} rows could not be matched.`
+        `Collection updated with ${result.ownedCopies.toLocaleString()} copies across ${result.ownedTitles.toLocaleString()} cards.`
       );
       await refreshCollectionViewsAfterImport();
+      await refreshImportHistory();
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : "Collection import failed.");
+    } finally {
+      setCsvImporting(false);
     }
   };
 
@@ -579,6 +835,7 @@ function App() {
 
     try {
       setErrorMessage("");
+      setCollectorSnapshotError("");
       setImportMessage("");
       setCollectorSnapshotFile(file);
       setCollectorSnapshotPreview(null);
@@ -587,10 +844,11 @@ function App() {
       const preview = await previewCollectorSnapshot(file);
       setCollectorSnapshotPreview(preview);
     } catch (error) {
+      const message = error instanceof Error ? error.message : "Collector snapshot preview failed.";
       setCollectorSnapshotFile(null);
       setCollectorSnapshotPreview(null);
       setCollectorPreviewSource(null);
-      setErrorMessage(error instanceof Error ? error.message : "Collector snapshot preview failed.");
+      setCollectorSnapshotError(message);
     } finally {
       setCollectorSnapshotPreviewLoading(false);
     }
@@ -599,6 +857,7 @@ function App() {
   const handleCaptureLatestCollectorSnapshot = async () => {
     try {
       setErrorMessage("");
+      setCollectorSnapshotError("");
       setImportMessage("");
       setCollectorHelperLoading(true);
       setCollectorSnapshotPreviewLoading(true);
@@ -607,11 +866,15 @@ function App() {
       setCollectorPreviewSource("latest-capture");
       const preview = await capturePreviewCollectorSnapshot();
       setCollectorSnapshotPreview(preview);
-      setImportMessage(`Captured ${preview.capture.filename}. Review the preview and confirm import when ready.`);
+      setImportMessage(
+        "Read the live collection from MTG Arena. Review the changes before updating."
+      );
       await refreshCollectorHelperStatus();
     } catch (error) {
+      const message = error instanceof Error ? error.message : "Failed to capture the live MTGA collection.";
       setCollectorPreviewSource(null);
-      setErrorMessage(error instanceof Error ? error.message : "Failed to capture the live MTGA collection.");
+      setCollectorSnapshotError(message);
+      await refreshCollectorHelperStatus().catch(() => undefined);
     } finally {
       setCollectorHelperLoading(false);
       setCollectorSnapshotPreviewLoading(false);
@@ -621,6 +884,7 @@ function App() {
   const handlePreviewLatestCollectorSnapshot = async () => {
     try {
       setErrorMessage("");
+      setCollectorSnapshotError("");
       setImportMessage("");
       setCollectorHelperLoading(true);
       setCollectorSnapshotPreviewLoading(true);
@@ -632,42 +896,55 @@ function App() {
       setImportMessage(`Previewed ${preview.capture.filename} from the local collector cache.`);
       await refreshCollectorHelperStatus();
     } catch (error) {
+      const message = error instanceof Error ? error.message : "Failed to preview the latest collector snapshot.";
       setCollectorPreviewSource(null);
-      setErrorMessage(error instanceof Error ? error.message : "Failed to preview the latest collector snapshot.");
+      setCollectorSnapshotError(message);
     } finally {
       setCollectorHelperLoading(false);
       setCollectorSnapshotPreviewLoading(false);
     }
   };
 
-  const handleConfirmCollectorSnapshotImport = async () => {
+  const handleConfirmCollectorSnapshotImport = async (confirmSuspiciousDiff: boolean) => {
     if (!collectorSnapshotFile && collectorPreviewSource !== "latest-capture") {
       return;
     }
 
     try {
       setErrorMessage("");
+      setCollectorSnapshotError("");
       setImportMessage("");
       setCollectorSnapshotImporting(true);
       let result: CollectionImportSummary | CollectorCaptureImportSummary;
 
       if (collectorPreviewSource === "latest-capture") {
-        result = await importLatestCollectorSnapshot();
+        if (
+          !collectorSnapshotPreview ||
+          !("capture" in collectorSnapshotPreview)
+        ) {
+          throw new Error("Read the collection from Arena again before importing.");
+        }
+        result = await importLatestCollectorSnapshot(
+          collectorSnapshotPreview.capture.id,
+          confirmSuspiciousDiff
+        );
       } else if (collectorSnapshotFile) {
-        result = await importCollectorSnapshot(collectorSnapshotFile);
+        result = await importCollectorSnapshot(collectorSnapshotFile, confirmSuspiciousDiff);
       } else {
         throw new Error("Choose a collector snapshot JSON or refresh from MTGA before importing.");
       }
 
       setCollectorSnapshotPreview(result);
       setImportMessage(
-        `Imported ${result.ownedCopies} playable copies across ${result.ownedTitles} titles from collector snapshot. ` +
+        `Updated from MTG Arena with ${result.ownedCopies} playable copies across ${result.ownedTitles} titles. ` +
           `${result.unresolvedCards.length} local matches unresolved, ${result.unmatchedGrpIds} grpIds unmatched.`
       );
       await refreshCollectionViewsAfterImport();
       await refreshCollectorHelperStatus();
+      await refreshImportHistory();
     } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : "Collector snapshot import failed.");
+      const message = error instanceof Error ? error.message : "Collector snapshot import failed.";
+      setCollectorSnapshotError(message);
     } finally {
       setCollectorSnapshotImporting(false);
     }
@@ -700,6 +977,64 @@ function App() {
     }
   };
 
+  const handleCaptureUntappedCollection = async () => {
+    try {
+      setErrorMessage("");
+      setImportMessage("");
+      setUntappedPreviewLoading(true);
+      const preview = await capturePreviewUntappedCollection();
+      setUntappedFile(null);
+      setUntappedPreview(preview);
+      setUntappedPreviewSource("latest-capture");
+      setLastAutoPreviewedCaptureId(preview.capture.id);
+      setImportMessage(
+        `${preview.catalogSync ? `Updated Scryfall to ${preview.catalogSync.cardCount.toLocaleString()} cards, then read ` : "Read "}` +
+          `${preview.rawEntryCount.toLocaleString()} Arena entries through the free Companion app. Review the changes below.`
+      );
+      await refreshUntappedHelperStatus();
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error
+          ? error.message
+          : "Failed to read the Arena collection through Companion."
+      );
+      await refreshUntappedHelperStatus().catch(() => undefined);
+    } finally {
+      setUntappedPreviewLoading(false);
+    }
+  };
+
+  const handleRestartUntappedCompanion = async () => {
+    try {
+      setErrorMessage("");
+      setImportMessage("");
+      setUntappedHelperLoading(true);
+      setUntappedPreviewLoading(true);
+      const nextStatus = await restartUntappedCompanion();
+      setUntappedHelperStatus(nextStatus);
+      const preview = await capturePreviewUntappedCollection();
+      setUntappedFile(null);
+      setUntappedPreview(preview);
+      setUntappedPreviewSource("latest-capture");
+      setLastAutoPreviewedCaptureId(preview.capture.id);
+      setImportMessage(
+        `Companion restarted, ${preview.catalogSync ? `updated Scryfall to ${preview.catalogSync.cardCount.toLocaleString()} cards, and ` : "then "}` +
+          `read ${preview.rawEntryCount.toLocaleString()} Arena entries. Review the changes below.`
+      );
+      await refreshUntappedHelperStatus();
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error
+          ? error.message
+          : "Failed to restart Companion for automatic sync."
+      );
+      await refreshUntappedHelperStatus().catch(() => undefined);
+    } finally {
+      setUntappedHelperLoading(false);
+      setUntappedPreviewLoading(false);
+    }
+  };
+
   const handleStopUntappedGuide = async () => {
     try {
       setErrorMessage("");
@@ -719,7 +1054,7 @@ function App() {
   };
 
   const handleCopyUntappedSnippet = async () => {
-    const snippet = untappedHelperStatus?.snippet ?? UNTAPPED_CAPTURE_SNIPPET;
+    const snippet = untappedHelperStatus?.snippet || UNTAPPED_CAPTURE_SNIPPET;
     const copied = await copyUntappedSnippetToClipboard(snippet);
     if (copied) {
       setImportMessage("Untapped DevTools snippet copied to clipboard.");
@@ -774,7 +1109,7 @@ function App() {
     }
   };
 
-  const handleConfirmUntappedImport = async () => {
+  const handleConfirmUntappedImport = async (confirmSuspiciousDiff: boolean) => {
     if (!untappedPreviewSource) {
       return;
     }
@@ -786,11 +1121,21 @@ function App() {
       let result: UntappedImportSummary;
 
       if (untappedPreviewSource === "latest-capture") {
-        const latestResult = await importLatestUntappedCapture();
+        const captureId =
+          untappedPreview && "capture" in untappedPreview
+            ? untappedPreview.capture.id
+            : untappedHelperStatus?.latestCapture?.id;
+        if (!captureId) {
+          throw new Error("Sync from Arena again before importing.");
+        }
+        const latestResult = await importLatestUntappedCapture(
+          captureId,
+          confirmSuspiciousDiff
+        );
         setLastAutoPreviewedCaptureId(getUntappedCaptureIdentity(latestResult.capture));
         result = latestResult;
       } else if (untappedFile) {
-        result = await importUntappedCollection(untappedFile);
+        result = await importUntappedCollection(untappedFile, confirmSuspiciousDiff);
       } else {
         throw new Error("Choose an Untapped JSON file or preview the latest capture before importing.");
       }
@@ -802,10 +1147,35 @@ function App() {
       );
       await refreshCollectionViewsAfterImport();
       await refreshUntappedHelperStatus();
+      await refreshImportHistory();
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : "Untapped import failed.");
     } finally {
       setUntappedImporting(false);
+    }
+  };
+
+  const handleRestoreCollectionImport = async (importId: string) => {
+    try {
+      setErrorMessage("");
+      setImportMessage("");
+      setRestoringImportId(importId);
+      await restoreCollectionImport(importId);
+      setCsvFile(null);
+      setCsvPreview(null);
+      setUntappedFile(null);
+      setUntappedPreview(null);
+      setUntappedPreviewSource(null);
+      setCollectorSnapshotFile(null);
+      setCollectorSnapshotPreview(null);
+      setCollectorPreviewSource(null);
+      setImportMessage("Previous collection restored.");
+      await refreshCollectionViewsAfterImport();
+      await refreshImportHistory();
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : "Failed to restore that collection update.");
+    } finally {
+      setRestoringImportId(null);
     }
   };
 
@@ -980,7 +1350,7 @@ function App() {
       displayTypeLine: card?.typeLine ?? deckCard.typeLine ?? "",
       displayManaCost: card?.manaCost ?? deckCard.manaCost ?? "",
       displayManaValue: card?.manaValue ?? deckCard.manaValue ?? 0,
-      displayOwnedCount: deckCard.ownedCount ?? 0
+      displayOwnedCount: deckCard.ownedCount
     };
   });
   const sortedDeckDisplayCards = [...deckDisplayCards].sort((left, right) => {
@@ -1083,6 +1453,23 @@ function App() {
     switchTab("search");
   };
 
+  const handleExportSearch = async () => {
+    try {
+      setErrorMessage("");
+      setImportMessage("");
+      setSearchExportLoading(true);
+      const response = await searchCards(buildSearchParams(searchState));
+      const csv = buildCardSearchCsv(response.items);
+      const dateStamp = new Date().toISOString().slice(0, 10);
+      downloadCsvFile(`mtga-card-search-${dateStamp}.csv`, csv);
+      setImportMessage(`Exported ${response.items.length.toLocaleString()} filtered card results.`);
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : "Search export failed.");
+    } finally {
+      setSearchExportLoading(false);
+    }
+  };
+
   return (
     <div className="app-shell">
       <header className="app-header">
@@ -1093,10 +1480,12 @@ function App() {
           <nav className="tab-strip app-tabs compact-tabs">
             {[
               ["search", "Search"],
+              ["coach", "Coach Beta"],
               ["stats", "Stats"],
               ["decks", "Decks"]
             ].map(([tab, label]) => (
               <button
+                aria-current={activeTab === tab ? "page" : undefined}
                 key={tab}
                 className={activeTab === tab ? "tab-button active" : "tab-button"}
                 onClick={() => switchTab(tab as typeof activeTab)}
@@ -1170,17 +1559,26 @@ function App() {
           </details>
 
           <button
+            aria-current={activeTab === "import" ? "page" : undefined}
             className={activeTab === "import" ? "tab-button active" : "tab-button"}
             onClick={() => switchTab("import")}
             type="button"
           >
-            Import
+            Collection
           </button>
         </div>
       </header>
 
-      {errorMessage ? <div className="banner error">{errorMessage}</div> : null}
-      {importMessage ? <div className="banner success">{importMessage}</div> : null}
+      {activeTab !== "import" && errorMessage ? (
+        <div className="banner error" role="alert">
+          {errorMessage}
+        </div>
+      ) : null}
+      {activeTab !== "import" && importMessage ? (
+        <div aria-live="polite" className="banner success" role="status">
+          {importMessage}
+        </div>
+      ) : null}
       {status && status.cards.total === 0 ? (
         <div className="banner warning">
           No Arena catalog is loaded yet. Run <code>npm run db:sync</code> from the project root,
@@ -1189,6 +1587,14 @@ function App() {
       ) : null}
 
       <main className={activeTab === "search" || activeTab === "stats" ? "app-main search-main" : "app-main"}>
+        {activeTab === "coach" ? (
+          <CoachScreen
+            status={status}
+            onOpenCollection={() => switchTab("import")}
+            onSave={handleSaveCoachDeck}
+          />
+        ) : null}
+
         {activeTab === "search" ? (
           <SearchScreen
             filtersCollapsed={filtersCollapsed}
@@ -1212,6 +1618,8 @@ function App() {
             onVisibleResultsCountChange={setVisibleResultsCount}
             viewMode={viewMode}
             onViewModeChange={setViewMode}
+            exportLoading={searchExportLoading}
+            onExportSearch={() => void handleExportSearch()}
             visibleCards={visibleCards}
             visibleSortedCards={visibleSortedCards}
             onClearDrilldown={() => setSearchState((current) => clearDrilldownState(current))}
@@ -1253,10 +1661,6 @@ function App() {
             onRefreshValidation={async (deckId) => {
               setValidation(await validateDeck(deckId));
             }}
-            onRefreshExport={async (deckId) => {
-              const arenaExport = await exportDeck(deckId);
-              setExportText(arenaExport.text);
-            }}
             exportText={exportText}
             deckSort={deckSort}
             deckGroup={deckGroup}
@@ -1266,15 +1670,44 @@ function App() {
             deckCardGroups={deckCardGroups}
             onChangeDeckQuantity={(cardId, section, delta) => void handleChangeDeckQuantity(cardId, section, delta)}
             onActiveDeckChange={setActiveDeck}
+            arenaDeckPreview={arenaDeckPreview}
+            arenaDeckPreviewLoading={arenaDeckPreviewLoading}
+            arenaDeckSyncing={arenaDeckSyncing}
+            includeStarterDecks={includeStarterDecks}
+            onIncludeStarterDecksChange={(value) => {
+              setIncludeStarterDecks(value);
+              setArenaDeckPreview(null);
+            }}
+            onPreviewArenaDecks={() => void handlePreviewArenaDecks()}
+            onSyncArenaDecks={() => void handleSyncArenaDecks()}
+            bulkExportLoading={bulkDeckExportLoading}
+            bulkExportStatus={bulkDeckExportStatus}
+            onCopyAllDecks={() => void handleCopyAllDecks()}
+            onDownloadAllDecks={() => void handleDownloadAllDecks()}
           />
         ) : null}
 
         {activeTab === "import" ? (
           <ImportScreen
             status={status}
+            importMessage={importMessage}
+            errorMessage={errorMessage}
             formatDateTime={formatDateTime}
             formatFileSize={formatFileSize}
-            untappedCaptureSnippet={untappedHelperStatus?.snippet ?? UNTAPPED_CAPTURE_SNIPPET}
+            csvFile={csvFile}
+            csvPreview={csvPreview}
+            csvPreviewLoading={csvPreviewLoading}
+            csvImporting={csvImporting}
+            onCsvPreview={(event) => void handleCsvPreview(event)}
+            onConfirmCsvImport={(confirmSuspiciousDiff) =>
+              void handleConfirmCsvImport(confirmSuspiciousDiff)
+            }
+            onClearCsvPreview={() => {
+              setCsvFile(null);
+              setCsvPreview(null);
+              setImportMessage("");
+            }}
+            untappedCaptureSnippet={untappedHelperStatus?.snippet || UNTAPPED_CAPTURE_SNIPPET}
             untappedHelperStatus={untappedHelperStatus}
             untappedGuideActive={untappedGuideActive}
             untappedHelperLoading={untappedHelperLoading}
@@ -1284,24 +1717,48 @@ function App() {
             untappedImporting={untappedImporting}
             untappedFile={untappedFile}
             onStartUntappedGuide={() => void handleStartUntappedGuide()}
+            onCaptureUntappedCollection={() => void handleCaptureUntappedCollection()}
+            onRestartUntappedCompanion={() => void handleRestartUntappedCompanion()}
             onCopyUntappedSnippet={() => void handleCopyUntappedSnippet()}
             onPreviewLatestUntappedCapture={() => void handlePreviewLatestUntappedCapture()}
             onStopUntappedGuide={() => void handleStopUntappedGuide()}
             onUntappedPreview={(event) => void handleUntappedPreview(event)}
-            onConfirmUntappedImport={() => void handleConfirmUntappedImport()}
+            onConfirmUntappedImport={(confirmSuspiciousDiff) =>
+              void handleConfirmUntappedImport(confirmSuspiciousDiff)
+            }
+            onClearUntappedPreview={() => {
+              setUntappedFile(null);
+              setUntappedPreview(null);
+              setUntappedPreviewSource(null);
+              setImportMessage("");
+            }}
             collectorHelperStatus={collectorHelperStatus}
             collectorHelperLoading={collectorHelperLoading}
+            collectorStatusRefreshing={collectorStatusRefreshing}
             collectorSnapshotPreviewLoading={collectorSnapshotPreviewLoading}
             collectorSnapshotImporting={collectorSnapshotImporting}
             collectorSnapshotPreview={collectorSnapshotPreview}
+            collectorSnapshotError={collectorSnapshotError}
             collectorPreviewSource={collectorPreviewSource}
             collectorSnapshotFile={collectorSnapshotFile}
             onCaptureLatestCollectorSnapshot={() => void handleCaptureLatestCollectorSnapshot()}
+            onRefreshCollectorStatus={() => void handleRefreshCollectorStatus()}
             onPreviewLatestCollectorSnapshot={() => void handlePreviewLatestCollectorSnapshot()}
             onCollectorSnapshotPreview={(event) => void handleCollectorSnapshotPreview(event)}
-            onConfirmCollectorSnapshotImport={() => void handleConfirmCollectorSnapshotImport()}
-            onImportCsv={(event) => void handleImport(event)}
-            formatImportPreviewContext={formatImportPreviewContext}
+            onConfirmCollectorSnapshotImport={(confirmSuspiciousDiff) =>
+              void handleConfirmCollectorSnapshotImport(confirmSuspiciousDiff)
+            }
+            onClearCollectorPreview={() => {
+              setCollectorSnapshotFile(null);
+              setCollectorSnapshotPreview(null);
+              setCollectorPreviewSource(null);
+              setCollectorSnapshotError("");
+              setImportMessage("");
+            }}
+            importHistory={importHistory}
+            importHistoryLoading={importHistoryLoading}
+            restoringImportId={restoringImportId}
+            onRestoreImport={(importId) => void handleRestoreCollectionImport(importId)}
           />
         ) : null}
       </main>
@@ -1736,7 +2193,11 @@ function App() {
                               <p>
                                 {deckCard.section}
                                 {deckCard.displayTypeLine ? ` · ${deckCard.displayTypeLine}` : ""}
-                                {typeof deckCard.displayOwnedCount === "number" ? ` · own ${deckCard.displayOwnedCount}` : ""}
+                                {deckCard.displayOwnedCount === null
+                                  ? " · unlimited"
+                                  : typeof deckCard.displayOwnedCount === "number"
+                                    ? ` · own ${deckCard.displayOwnedCount}`
+                                    : ""}
                               </p>
                             </div>
                             <div className="quantity-controls">

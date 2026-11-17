@@ -20,4 +20,14 @@ export const FORMAT_LABELS: Record<ArenaFormat, string> = {
   standardbrawl: "Standard Brawl"
 };
 
-export const BRAWL_FORMATS = new Set<ArenaFormat>(["brawl", "standardbrawl"]);
+export const DECK_FORMATS = [...ARENA_FORMATS, "limited", "other"] as const;
+
+export type DeckFormat = (typeof DECK_FORMATS)[number];
+
+export const DECK_FORMAT_LABELS: Record<DeckFormat, string> = {
+  ...FORMAT_LABELS,
+  limited: "Limited",
+  other: "Other / Event"
+};
+
+export const BRAWL_FORMATS = new Set<DeckFormat>(["brawl", "standardbrawl"]);

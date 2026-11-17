@@ -13,6 +13,13 @@ const rarityBreakdown: StatsBreakdownItem = {
 };
 
 describe("useSyncedCardFilters", () => {
+  it("defaults stats to any format while keeping the initial catalog search scoped", () => {
+    const { result } = renderHook(() => useSyncedCardFilters());
+
+    expect(result.current.statsState.format).toBe("");
+    expect(result.current.searchState.format).toBe("standard");
+  });
+
   it("opens a stats drilldown in search while preserving the current stats filters", () => {
     const { result } = renderHook(() => useSyncedCardFilters());
 

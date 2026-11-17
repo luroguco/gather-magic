@@ -1,29 +1,33 @@
+import {
+  collectorSnapshotV1Schema,
+  isCollectorCatalogMatchSafe,
+  type CollectorSnapshotV1
+} from "@mtga/contracts";
 import type { DbHandle } from "../lib/database.js";
+import {
+  CollectionImportConfirmationRequiredError,
+  isSuspiciousCollectionDiff,
+  type CollectionDiff
+} from "./collectionDiff.js";
 import { getOwnedCountView } from "../lib/cardCopies.js";
+import { recordCurrentCollectionSnapshot } from "./collectionHistory.js";
 
-export type UntappedCatalogSource = "database" | "untapped-public";
+export type UntappedCatalogSource = "database" | "untapped-public" | "hybrid";
 export type CollectionImportSource = "untapped-json" | "collector-snapshot";
 
 type RawCollectionMap = Record<string, number>;
-type CollectorSnapshotPayload = {
-  snapshotVersion: number;
-  capturedAt?: string;
-  platform?: string;
-  collectorVersion?: string;
-  mtgaPid?: number;
-  diagnostics?: {
-    source?: string;
-    warnings?: string[];
-  };
-  collection: RawCollectionMap;
-};
+type CollectorSnapshotPayload = CollectorSnapshotV1;
 
 export type CollectorSnapshotMetadata = {
   snapshotVersion: number;
+  status?: "complete";
   capturedAt?: string;
   platform?: string;
   collectorVersion?: string;
   mtgaPid?: number;
+  mtgaBuild?: string;
+  entryCount?: number;
+  totalQuantity?: number;
   diagnostics?: {
     source?: string;
     warnings?: string[];
@@ -91,12 +95,7 @@ export type CollectionImportSummary = {
     printCount: number;
     reason: string;
   }>;
-  diff: {
-    addedTitles: number;
-    removedTitles: number;
-    changedTitles: number;
-    unchangedTitles: number;
-  };
+  diff: CollectionDiff;
 };
 
 export type UntappedImportSummary = CollectionImportSummary;
@@ -106,15 +105,15 @@ type CardRules = {
   oracleText: string;
 };
 
-type CatalogEntry = {
+export type ArenaCardCatalogEntry = {
   name: string;
   cardId: string;
   setCode: string | null;
   collectorNumber: string | null;
 };
 
-type CatalogLookup = {
-  lookup: Map<number, CatalogEntry>;
+export type ArenaCardCatalogLookup = {
+  lookup: Map<number, ArenaCardCatalogEntry>;
   metadata?: NormalizedUntappedPayload["catalogMetadata"];
 };
 
@@ -124,6 +123,20 @@ type UntappedPublicCard = {
   set?: string;
   collectorNumber?: string;
 };
+
+export class CollectorCatalogMismatchError extends Error {
+  readonly statusCode = 422;
+  readonly code = "COLLECTOR_CATALOG_MISMATCH";
+
+  constructor(matchedGrpIds: number, rawEntryCount: number) {
+    const matchRate =
+      rawEntryCount > 0 ? Math.round((matchedGrpIds / rawEntryCount) * 100) : 0;
+    super(
+      `Only ${matchedGrpIds.toLocaleString()} of ${rawEntryCount.toLocaleString()} Arena entries matched the card catalog (${matchRate}%). Sync card data and capture again before replacing the collection.`
+    );
+    this.name = "CollectorCatalogMismatchError";
+  }
+}
 
 type UntappedLocaleEntry = {
   id: number;
@@ -144,7 +157,7 @@ type ResolvedCollectionEntry = {
 const DEFAULT_UNTAPPED_BUILD = "latest";
 const DEFAULT_UNTAPPED_LOCALE = "en";
 const defaultBasicNames = new Set(["Plains", "Island", "Swamp", "Mountain", "Forest"]);
-const untappedCatalogCache = new Map<string, Promise<CatalogLookup>>();
+const untappedCatalogCache = new Map<string, Promise<ArenaCardCatalogLookup>>();
 
 const normalizeName = (value: string) => value.trim().toLowerCase().replace(/\s+/g, " ");
 
@@ -166,10 +179,14 @@ const isNumericKeyedMap = (value: unknown): value is RawCollectionMap => {
 
 const normalizeCollectorSnapshotMetadata = (value: CollectorSnapshotPayload): CollectorSnapshotMetadata => ({
   snapshotVersion: value.snapshotVersion,
+  status: value.status,
   ...(typeof value.capturedAt === "string" ? { capturedAt: value.capturedAt } : {}),
   ...(typeof value.platform === "string" ? { platform: value.platform } : {}),
   ...(typeof value.collectorVersion === "string" ? { collectorVersion: value.collectorVersion } : {}),
   ...(typeof value.mtgaPid === "number" ? { mtgaPid: value.mtgaPid } : {}),
+  ...(typeof value.mtgaBuild === "string" ? { mtgaBuild: value.mtgaBuild } : {}),
+  entryCount: value.entryCount,
+  totalQuantity: value.totalQuantity,
   ...(value.diagnostics
     ? {
         diagnostics: {
@@ -185,11 +202,7 @@ const normalizeCollectorSnapshotMetadata = (value: CollectorSnapshotPayload): Co
 });
 
 const isCollectorSnapshotPayload = (value: unknown): value is CollectorSnapshotPayload => {
-  if (!isRecord(value)) {
-    return false;
-  }
-
-  return Number.isInteger(value.snapshotVersion) && isNumericKeyedMap(value.collection);
+  return collectorSnapshotV1Schema.safeParse(value).success;
 };
 
 export const findCollectionOwnershipMap = (
@@ -234,7 +247,7 @@ export const findCollectionOwnershipMap = (
 
 export const findUntappedCollectionMap = findCollectionOwnershipMap;
 
-const buildDatabaseCatalogLookup = (db: DbHandle): CatalogLookup => {
+const buildDatabaseCatalogLookup = (db: DbHandle): ArenaCardCatalogLookup => {
   const rows = db
     .prepare(`
       SELECT
@@ -255,7 +268,7 @@ const buildDatabaseCatalogLookup = (db: DbHandle): CatalogLookup => {
       collector_number: string | null;
     }>;
 
-  const lookup = new Map<number, CatalogEntry>();
+  const lookup = new Map<number, ArenaCardCatalogEntry>();
   for (const row of rows) {
     lookup.set(row.arena_id, {
       name: row.name,
@@ -299,7 +312,10 @@ const buildUntappedLocaleUrl = (build: string, locale: string) =>
   `https://mtgajson.untapped.gg/v1/${build}/loc_${locale}.json`;
 const extractUntappedActualBuild = (url: string) => /\/v1\/([^/]+)\/.+/.exec(url)?.[1] ?? null;
 
-const fetchUntappedPublicCatalogLookup = async (build: string, locale: string): Promise<CatalogLookup> => {
+const fetchUntappedPublicCatalogLookup = async (
+  build: string,
+  locale: string
+): Promise<ArenaCardCatalogLookup> => {
   const cacheKey = `${build}::${locale}`;
   const cached = untappedCatalogCache.get(cacheKey);
   if (cached) {
@@ -309,12 +325,14 @@ const fetchUntappedPublicCatalogLookup = async (build: string, locale: string): 
   const pending = (async () => {
     const [cardsResponse, localeResponse] = await Promise.all([
       fetch(buildUntappedCardsUrl(build), {
+        signal: AbortSignal.timeout(10_000),
         headers: {
           "User-Agent": "mtga-collection-explorer/0.1",
           Accept: "application/json;q=0.9,*/*;q=0.8"
         }
       }),
       fetch(buildUntappedLocaleUrl(build, locale), {
+        signal: AbortSignal.timeout(10_000),
         headers: {
           "User-Agent": "mtga-collection-explorer/0.1",
           Accept: "application/json;q=0.9,*/*;q=0.8"
@@ -346,7 +364,7 @@ const fetchUntappedPublicCatalogLookup = async (build: string, locale: string): 
       }
     }
 
-    const lookup = new Map<number, CatalogEntry>();
+    const lookup = new Map<number, ArenaCardCatalogEntry>();
     for (const card of cards) {
       const name = namesByTitleId.get(card.titleId);
       if (!name) {
@@ -379,16 +397,49 @@ const fetchUntappedPublicCatalogLookup = async (build: string, locale: string): 
   }
 };
 
-const loadCatalogLookup = async (
+export const loadArenaCardCatalogLookup = async (
   db: DbHandle,
   options: {
     catalogSource?: UntappedCatalogSource;
     untappedBuild?: string;
     untappedLocale?: string;
-  }
-): Promise<CatalogLookup> => {
+  },
+  requiredGrpIds: number[] = []
+): Promise<ArenaCardCatalogLookup> => {
   if ((options.catalogSource ?? "untapped-public") === "database") {
     return buildDatabaseCatalogLookup(db);
+  }
+
+  if (options.catalogSource === "hybrid") {
+    const databaseCatalog = buildDatabaseCatalogLookup(db);
+    const databaseMatchRate =
+      requiredGrpIds.length > 0
+        ? requiredGrpIds.filter((grpId) => {
+            const entry = databaseCatalog.lookup.get(grpId);
+            return entry && !entry.cardId.startsWith("placeholder:");
+          }).length / requiredGrpIds.length
+        : 0;
+    if (databaseMatchRate >= 0.98) {
+      return databaseCatalog;
+    }
+    try {
+      const publicCatalog = await fetchUntappedPublicCatalogLookup(
+        options.untappedBuild ?? DEFAULT_UNTAPPED_BUILD,
+        options.untappedLocale ?? DEFAULT_UNTAPPED_LOCALE
+      );
+      const lookup = new Map(publicCatalog.lookup);
+      for (const [grpId, entry] of databaseCatalog.lookup) {
+        if (!entry.cardId.startsWith("placeholder:") || !lookup.has(grpId)) {
+          lookup.set(grpId, entry);
+        }
+      }
+      return {
+        lookup,
+        ...(publicCatalog.metadata ? { metadata: publicCatalog.metadata } : {})
+      };
+    } catch {
+      return databaseCatalog;
+    }
   }
 
   return fetchUntappedPublicCatalogLookup(
@@ -412,7 +463,10 @@ export const normalizeUntappedCollectionPayload = async (
   }
 
   const catalogSource = options?.catalogSource ?? "untapped-public";
-  const catalog = await loadCatalogLookup(db, options ?? {});
+  const requiredGrpIds = Object.keys(found.map)
+    .map((grpId) => Number.parseInt(grpId, 10))
+    .filter((grpId) => Number.isFinite(grpId));
+  const catalog = await loadArenaCardCatalogLookup(db, options ?? {}, requiredGrpIds);
   const cardRulesLookup = buildCardRulesLookup(db);
   const cards = new Map<string, NormalizedUntappedCardEntry>();
   const unmatchedEntries: NormalizedUntappedPayload["unmatchedEntries"] = [];
@@ -540,12 +594,28 @@ const resolveNormalizedCardsToLocalCollection = (
     FROM cards
     INNER JOIN card_prints ON card_prints.card_id = cards.id
     WHERE cards.normalized_name = ?
+      AND cards.id NOT LIKE 'placeholder:%'
+      AND card_prints.set_code = ?
+  `);
+  const matchFrontNameAndSet = db.prepare(`
+    SELECT DISTINCT cards.id AS card_id
+    FROM cards
+    INNER JOIN card_prints ON card_prints.card_id = cards.id
+    WHERE cards.normalized_name LIKE ?
+      AND cards.id NOT LIKE 'placeholder:%'
       AND card_prints.set_code = ?
   `);
   const matchByName = db.prepare(`
     SELECT id AS card_id
     FROM cards
     WHERE normalized_name = ?
+      AND id NOT LIKE 'placeholder:%'
+  `);
+  const matchFrontName = db.prepare(`
+    SELECT id AS card_id
+    FROM cards
+    WHERE normalized_name LIKE ?
+      AND id NOT LIKE 'placeholder:%'
   `);
 
   const entries = new Map<string, ResolvedCollectionEntry>();
@@ -560,9 +630,10 @@ const resolveNormalizedCardsToLocalCollection = (
         continue;
       }
 
-      const rows = matchByNameAndSet.all(normalizedName, variant.setCode.toUpperCase()) as Array<{
-        card_id: string;
-      }>;
+      const rows = matchByNameAndSet.all(
+        normalizedName,
+        variant.setCode.toUpperCase()
+      ) as Array<{ card_id: string }>;
 
       for (const row of rows) {
         const score = candidateScores.get(row.card_id) ?? { quantity: 0, variantMatches: 0 };
@@ -576,10 +647,49 @@ const resolveNormalizedCardsToLocalCollection = (
     let reason = resolvedCardId ? "name+set" : "";
 
     if (!resolvedCardId) {
-      const nameMatches = matchByName.all(normalizedName) as Array<{ card_id: string }>;
+      const frontFaceCandidateScores = new Map<
+        string,
+        { quantity: number; variantMatches: number }
+      >();
+      for (const variant of card.variants) {
+        if (!variant.setCode) {
+          continue;
+        }
+        const rows = matchFrontNameAndSet.all(
+          `${normalizedName} // %`,
+          variant.setCode.toUpperCase()
+        ) as Array<{ card_id: string }>;
+        for (const row of rows) {
+          const score = frontFaceCandidateScores.get(row.card_id) ?? {
+            quantity: 0,
+            variantMatches: 0
+          };
+          score.quantity += variant.quantity;
+          score.variantMatches += 1;
+          frontFaceCandidateScores.set(row.card_id, score);
+        }
+      }
+      resolvedCardId = chooseBestCandidateCardId(frontFaceCandidateScores);
+      reason = resolvedCardId ? "front-name+set" : "";
+    }
+
+    if (!resolvedCardId) {
+      const nameMatches = matchByName.all(normalizedName) as Array<{
+        card_id: string;
+      }>;
       if (nameMatches.length === 1) {
         resolvedCardId = nameMatches[0]?.card_id ?? null;
         reason = "name";
+      }
+    }
+
+    if (!resolvedCardId) {
+      const frontNameMatches = matchFrontName.all(
+        `${normalizedName} // %`
+      ) as Array<{ card_id: string }>;
+      if (frontNameMatches.length === 1) {
+        resolvedCardId = frontNameMatches[0]?.card_id ?? null;
+        reason = "front-name";
       }
     }
 
@@ -658,7 +768,13 @@ const computeCollectionDiff = (db: DbHandle, nextEntries: Map<string, ResolvedCo
   };
 };
 
-const replaceCollectionSnapshot = (db: DbHandle, entries: Map<string, ResolvedCollectionEntry>, importedAt: string) => {
+const replaceCollectionSnapshot = (
+  db: DbHandle,
+  entries: Map<string, ResolvedCollectionEntry>,
+  importedAt: string,
+  source: CollectionImportSource,
+  metadata?: Record<string, unknown>
+) => {
   const transaction = db.transaction(() => {
     db.prepare("DELETE FROM collection_cards").run();
     const insertPlaceholderCardIfNeeded = db.prepare(`
@@ -695,6 +811,12 @@ const replaceCollectionSnapshot = (db: DbHandle, entries: Map<string, ResolvedCo
         imported_at: importedAt
       });
     }
+
+    recordCurrentCollectionSnapshot(db, {
+      source,
+      importedAt,
+      ...(metadata ? { metadata } : {})
+    });
   });
 
   transaction();
@@ -774,11 +896,19 @@ export const importUntappedCollectionJson = async (
     catalogSource?: UntappedCatalogSource;
     untappedBuild?: string;
     untappedLocale?: string;
+    confirmSuspiciousDiff?: boolean;
   }
 ): Promise<UntappedImportSummary> => {
   const prepared = await prepareCollectionImport(db, rawJson, options);
+  if (isSuspiciousCollectionDiff(prepared.diff) && !options?.confirmSuspiciousDiff) {
+    throw new CollectionImportConfirmationRequiredError(prepared.diff);
+  }
   const importedAt = new Date().toISOString();
-  replaceCollectionSnapshot(db, prepared.entries, importedAt);
+  replaceCollectionSnapshot(db, prepared.entries, importedAt, "untapped-json", {
+    extractedPath: prepared.normalizedPayload.extractedPath,
+    rawEntryCount: prepared.normalizedPayload.rawEntryCount,
+    unmatchedGrpIds: prepared.normalizedPayload.unmatchedGrpIds
+  });
 
   return buildCollectionImportSummary(
     "untapped-json",
@@ -799,7 +929,8 @@ export const previewCollectorSnapshotImport = async (
     untappedLocale?: string;
   }
 ): Promise<CollectionImportSummary> => {
-  const prepared = await prepareCollectionImport(db, rawJson, options);
+  const parsedPayload = collectorSnapshotV1Schema.parse(JSON.parse(rawJson) as unknown);
+  const prepared = await prepareCollectionImport(db, JSON.stringify(parsedPayload), options);
   return buildCollectionImportSummary(
     "collector-snapshot",
     prepared.normalizedPayload,
@@ -816,11 +947,28 @@ export const importCollectorSnapshotJson = async (
     catalogSource?: UntappedCatalogSource;
     untappedBuild?: string;
     untappedLocale?: string;
+    confirmSuspiciousDiff?: boolean;
   }
 ): Promise<CollectionImportSummary> => {
-  const prepared = await prepareCollectionImport(db, rawJson, options);
+  const parsedPayload = collectorSnapshotV1Schema.parse(JSON.parse(rawJson) as unknown);
+  const prepared = await prepareCollectionImport(db, JSON.stringify(parsedPayload), options);
+  if (!isCollectorCatalogMatchSafe(prepared.normalizedPayload)) {
+    throw new CollectorCatalogMismatchError(
+      prepared.normalizedPayload.matchedGrpIds,
+      prepared.normalizedPayload.rawEntryCount
+    );
+  }
+  if (isSuspiciousCollectionDiff(prepared.diff) && !options?.confirmSuspiciousDiff) {
+    throw new CollectionImportConfirmationRequiredError(prepared.diff);
+  }
   const importedAt = new Date().toISOString();
-  replaceCollectionSnapshot(db, prepared.entries, importedAt);
+  replaceCollectionSnapshot(db, prepared.entries, importedAt, "collector-snapshot", {
+    snapshotVersion: parsedPayload.snapshotVersion,
+    capturedAt: parsedPayload.capturedAt,
+    collectorVersion: parsedPayload.collectorVersion,
+    rawEntryCount: prepared.normalizedPayload.rawEntryCount,
+    unmatchedGrpIds: prepared.normalizedPayload.unmatchedGrpIds
+  });
 
   return buildCollectionImportSummary(
     "collector-snapshot",

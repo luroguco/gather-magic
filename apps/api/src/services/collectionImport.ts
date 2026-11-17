@@ -1,9 +1,16 @@
 import { parse } from "csv-parse/sync";
+
 import type { DbHandle } from "../lib/database.js";
+import {
+  CollectionImportConfirmationRequiredError,
+  isSuspiciousCollectionDiff,
+  type CollectionDiff
+} from "./collectionDiff.js";
+import { recordCurrentCollectionSnapshot } from "./collectionHistory.js";
 
 const REQUIRED_COLUMNS = ["Id", "Name", "Set", "Color", "Rarity", "Count", "PrintCount"] as const;
 
-type CollectionRow = {
+export type CollectionRow = {
   Id: string;
   Name: string;
   Set: string;
@@ -11,6 +18,30 @@ type CollectionRow = {
   Rarity: string;
   Count: string;
   PrintCount: string;
+};
+
+type PreparedCollectionEntry = {
+  count: number;
+  printCount: number;
+  rows: CollectionRow[];
+};
+
+type PreparedCollectionCsv = {
+  records: CollectionRow[];
+  matched: Map<string, PreparedCollectionEntry>;
+  unresolvedRows: CollectionRow[];
+};
+
+export type CollectionCsvPreview = {
+  source: "collection-csv";
+  importedAt?: string;
+  rowsRead: number;
+  cardsMatched: number;
+  ownedTitles: number;
+  ownedCopies: number;
+  rawOwnedCopies: number;
+  unresolvedRows: CollectionRow[];
+  diff: CollectionDiff;
 };
 
 const normalizeName = (value: string) => value.trim().toLowerCase().replace(/\s+/g, " ");
@@ -28,7 +59,7 @@ const colorMap: Record<string, string[]> = {
 const getPlaceholderCardId = (row: CollectionRow) =>
   `placeholder:${row.Set.toUpperCase()}:${normalizeName(row.Name).replace(/[^a-z0-9]+/g, "-")}`;
 
-export const importCollectionCsv = (db: DbHandle, csvContent: string) => {
+const prepareCollectionCsv = (db: DbHandle, csvContent: string): PreparedCollectionCsv => {
   const records = parse(csvContent, {
     bom: true,
     columns: true,
@@ -56,8 +87,111 @@ export const importCollectionCsv = (db: DbHandle, csvContent: string) => {
     WHERE cards.normalized_name = ?
       AND card_prints.set_code = ?
   `);
+  const matched = new Map<string, PreparedCollectionEntry>();
+  const unresolvedRows: CollectionRow[] = [];
 
-  const importedAt = new Date().toISOString();
+  for (const row of records) {
+    const count = Number.parseInt(row.Count, 10);
+    const printCount = Number.parseInt(row.PrintCount, 10);
+    if (!Number.isFinite(count) || count <= 0) {
+      continue;
+    }
+
+    const arenaId = Number.parseInt(row.Id, 10);
+    const byArenaId = Number.isFinite(arenaId)
+      ? (matchByArenaId.get(arenaId) as { card_id: string } | undefined)
+      : undefined;
+    const byNameAndSet =
+      byArenaId ??
+      (matchByNameAndSet.get(normalizeName(row.Name), row.Set.toUpperCase()) as
+        | { card_id: string }
+        | undefined);
+    const cardId = byNameAndSet?.card_id ?? getPlaceholderCardId(row);
+
+    if (!byNameAndSet) {
+      unresolvedRows.push(row);
+    }
+
+    const entry = matched.get(cardId) ?? {
+      count: 0,
+      printCount: 0,
+      rows: []
+    };
+    entry.count = Math.max(entry.count, count);
+    entry.printCount += Number.isFinite(printCount) ? printCount : 0;
+    entry.rows.push(row);
+    matched.set(cardId, entry);
+  }
+
+  return {
+    records,
+    matched,
+    unresolvedRows
+  };
+};
+
+const buildCollectionDiff = (
+  db: DbHandle,
+  matched: Map<string, PreparedCollectionEntry>
+): CollectionDiff => {
+  const currentEntries = new Map(
+    (
+      db
+        .prepare("SELECT card_id, count, print_count FROM collection_cards")
+        .all() as Array<{ card_id: string; count: number; print_count: number }>
+    ).map((entry) => [
+      entry.card_id,
+      {
+        count: entry.count,
+        printCount: entry.print_count
+      }
+    ])
+  );
+  let addedTitles = 0;
+  let changedTitles = 0;
+  let unchangedTitles = 0;
+
+  for (const [cardId, entry] of matched.entries()) {
+    const current = currentEntries.get(cardId);
+    if (!current) {
+      addedTitles += 1;
+    } else if (current.count === entry.count && current.printCount === entry.printCount) {
+      unchangedTitles += 1;
+    } else {
+      changedTitles += 1;
+    }
+    currentEntries.delete(cardId);
+  }
+
+  return {
+    addedTitles,
+    removedTitles: currentEntries.size,
+    changedTitles,
+    unchangedTitles
+  };
+};
+
+const buildCollectionCsvPreview = (
+  db: DbHandle,
+  prepared: PreparedCollectionCsv
+): CollectionCsvPreview => ({
+  source: "collection-csv",
+  rowsRead: prepared.records.length,
+  cardsMatched: prepared.matched.size,
+  ownedTitles: prepared.matched.size,
+  ownedCopies: [...prepared.matched.values()].reduce((total, entry) => total + entry.count, 0),
+  rawOwnedCopies: [...prepared.matched.values()].reduce(
+    (total, entry) => total + entry.printCount,
+    0
+  ),
+  unresolvedRows: prepared.unresolvedRows,
+  diff: buildCollectionDiff(db, prepared.matched)
+});
+
+const insertUnresolvedPlaceholders = (
+  db: DbHandle,
+  unresolvedRows: CollectionRow[]
+) => {
   const insertPlaceholderCard = db.prepare(`
     INSERT OR IGNORE INTO cards (
       id, oracle_id, name, normalized_name, oracle_text, mana_cost, mana_value,
@@ -76,83 +210,54 @@ export const importCollectionCsv = (db: DbHandle, csvContent: string) => {
       @printId, @cardId, @arenaId, @setCode, NULL, '["arena"]', NULL, NULL
     )
   `);
-  const matched = new Map<
-    string,
-    {
-      count: number;
-      printCount: number;
-      rows: CollectionRow[];
-    }
-  >();
-  const unresolvedRows: CollectionRow[] = [];
 
-  for (const row of records) {
-    const count = Number.parseInt(row.Count, 10);
-    const printCount = Number.parseInt(row.PrintCount, 10);
+  for (const row of unresolvedRows) {
+    const placeholderId = getPlaceholderCardId(row);
+    const colors = colorMap[row.Color.toLowerCase()] ?? [];
+    const arenaId = Number.parseInt(row.Id, 10);
+    insertPlaceholderCard.run({
+      id: placeholderId,
+      name: row.Name,
+      normalizedName: normalizeName(row.Name),
+      colorsJson: JSON.stringify(colors),
+      colorIdentityJson: JSON.stringify(colors),
+      rarity: row.Rarity.toLowerCase(),
+      setCode: row.Set.toUpperCase()
+    });
+    insertPlaceholderPrint.run({
+      printId: `placeholder-print:${row.Id}`,
+      cardId: placeholderId,
+      arenaId: Number.isFinite(arenaId) ? arenaId : null,
+      setCode: row.Set.toUpperCase()
+    });
+  }
+};
 
-    if (!Number.isFinite(count) || count <= 0) {
-      continue;
-    }
+export const previewCollectionCsv = (db: DbHandle, csvContent: string) =>
+  buildCollectionCsvPreview(db, prepareCollectionCsv(db, csvContent));
 
-    const byArenaId =
-      Number.isFinite(Number.parseInt(row.Id, 10))
-        ? (matchByArenaId.get(Number.parseInt(row.Id, 10)) as { card_id: string } | undefined)
-        : undefined;
-    const byNameAndSet =
-      byArenaId ??
-      (matchByNameAndSet.get(normalizeName(row.Name), row.Set.toUpperCase()) as
-        | { card_id: string }
-        | undefined);
-
-    if (!byNameAndSet) {
-      const placeholderId = getPlaceholderCardId(row);
-      const colors = colorMap[row.Color.toLowerCase()] ?? [];
-      insertPlaceholderCard.run({
-        id: placeholderId,
-        name: row.Name,
-        normalizedName: normalizeName(row.Name),
-        colorsJson: JSON.stringify(colors),
-        colorIdentityJson: JSON.stringify(colors),
-        rarity: row.Rarity.toLowerCase(),
-        setCode: row.Set.toUpperCase()
-      });
-      insertPlaceholderPrint.run({
-        printId: `placeholder-print:${row.Id}`,
-        cardId: placeholderId,
-        arenaId: Number.parseInt(row.Id, 10),
-        setCode: row.Set.toUpperCase()
-      });
-      unresolvedRows.push(row);
-      const placeholderEntry = matched.get(placeholderId) ?? {
-        count: 0,
-        printCount: 0,
-        rows: []
-      };
-      placeholderEntry.count = Math.max(placeholderEntry.count, count);
-      placeholderEntry.printCount += Number.isFinite(printCount) ? printCount : 0;
-      placeholderEntry.rows.push(row);
-      matched.set(placeholderId, placeholderEntry);
-      continue;
-    }
-
-    const entry = matched.get(byNameAndSet.card_id) ?? {
-      count: 0,
-      printCount: 0,
-      rows: []
-    };
-    entry.count = Math.max(entry.count, count);
-    entry.printCount += Number.isFinite(printCount) ? printCount : 0;
-    entry.rows.push(row);
-    matched.set(byNameAndSet.card_id, entry);
+export const importCollectionCsv = (
+  db: DbHandle,
+  csvContent: string,
+  options?: {
+    confirmSuspiciousDiff?: boolean;
+  }
+): CollectionCsvPreview & { importedAt: string } => {
+  const prepared = prepareCollectionCsv(db, csvContent);
+  const preview = buildCollectionCsvPreview(db, prepared);
+  if (isSuspiciousCollectionDiff(preview.diff) && !options?.confirmSuspiciousDiff) {
+    throw new CollectionImportConfirmationRequiredError(preview.diff);
   }
 
-  const replaceCollection = db.transaction(() => {
+  const importedAt = new Date().toISOString();
+  db.transaction(() => {
+    insertUnresolvedPlaceholders(db, prepared.unresolvedRows);
     db.prepare("DELETE FROM collection_cards").run();
     const insert = db.prepare(`
       INSERT INTO collection_cards (card_id, count, print_count, source_rows_json, imported_at)
       VALUES (@cardId, @count, @printCount, @sourceRowsJson, @importedAt)
     `);
-    for (const [cardId, entry] of matched.entries()) {
+    for (const [cardId, entry] of prepared.matched.entries()) {
       insert.run({
         cardId,
         count: entry.count,
@@ -161,15 +266,19 @@ export const importCollectionCsv = (db: DbHandle, csvContent: string) => {
         importedAt
       });
     }
-  });
 
-  replaceCollection();
+    recordCurrentCollectionSnapshot(db, {
+      source: "collection-csv",
+      importedAt,
+      metadata: {
+        rowsRead: prepared.records.length,
+        unresolvedRows: prepared.unresolvedRows.length
+      }
+    });
+  })();
 
   return {
-    importedAt,
-    rowsRead: records.length,
-    cardsMatched: matched.size,
-    ownedCopies: [...matched.values()].reduce((total, entry) => total + entry.count, 0),
-    unresolvedRows
+    ...preview,
+    importedAt
   };
 };

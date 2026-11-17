@@ -1,3 +1,4 @@
+import { cardPrintSchema } from "@mtga/contracts";
 import { getOwnedCountView } from "../lib/cardCopies.js";
 import type { DbHandle } from "../lib/database.js";
 import { ARENA_FORMATS, type ArenaFormat } from "../lib/formats.js";
@@ -82,7 +83,7 @@ export type CardStatsResponse = {
 
 const playableOwnedCountSql = `
   CASE
-    WHEN lower(cards.type_line) LIKE '%basic land%' THEN coalesce(collection_cards.count, 0)
+    WHEN lower(cards.type_line) LIKE '%basic%land%' THEN coalesce(collection_cards.count, 0)
     WHEN lower(cards.oracle_text) LIKE '%a deck can have any number of cards named%' THEN coalesce(collection_cards.count, 0)
     WHEN lower(cards.oracle_text) GLOB '*a deck can have up to [0-9]* cards named*' THEN
       MIN(
@@ -474,7 +475,7 @@ const filteredCardsCteSql = (where: string) => `
       cards.color_identity_json,
       cards.rarity,
       cards.preferred_set_code,
-      coalesce(collection_cards.count, 0) AS raw_owned_count,
+      coalesce(collection_cards.print_count, collection_cards.count, 0) AS raw_owned_count,
       ${playableOwnedCountSql} AS playable_owned_count,
       ${colorBucketSql} AS color_bucket,
       ${manaValueBucketSql} AS mana_value_bucket,
@@ -858,7 +859,7 @@ export const getCardById = (db: DbHandle, cardId: string) => {
     return null;
   }
 
-  const prints = db
+  const printRows = db
     .prepare(
       `
       SELECT print_id, arena_id, set_code, collector_number, image_url, released_at
@@ -867,7 +868,24 @@ export const getCardById = (db: DbHandle, cardId: string) => {
       ORDER BY released_at DESC, set_code ASC
     `
     )
-    .all(cardId);
+    .all(cardId) as Array<{
+    print_id: string;
+    arena_id: number | null;
+    set_code: string;
+    collector_number: string | null;
+    image_url: string | null;
+    released_at: string | null;
+  }>;
+  const prints = printRows.map((print) =>
+    cardPrintSchema.parse({
+      printId: print.print_id,
+      arenaId: print.arena_id,
+      setCode: print.set_code,
+      collectorNumber: print.collector_number,
+      imageUrl: print.image_url,
+      releasedAt: print.released_at
+    })
+  );
 
   return {
     ...mapCardRow(row),

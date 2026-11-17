@@ -4,12 +4,13 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "build": "tsc -b && vite build",
+    "build": "tsc -p tsconfig.json --noEmit && vite build",
     "dev": "vite",
-    "lint": "tsc -b --pretty false",
+    "lint": "tsc -p tsconfig.json --noEmit --pretty false",
     "test": "vitest run"
   },
   "dependencies": {
+    "@mtga/contracts": "*",
     "react": "^19.2.0",
     "react-dom": "^19.2.0"
   },

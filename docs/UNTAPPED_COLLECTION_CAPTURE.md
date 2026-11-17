@@ -1,18 +1,36 @@
 # Untapped Collection Capture
 
 ## Purpose
-This is a research-only path for extracting Untapped's in-memory `mtga.collection` payload without shipping anything in the app yet.
+
+For this personal workspace, the default collection workflow reads Untapped Companion's in-memory `mtga.collection` payload automatically. It uses the free Companion app already running locally; it does not require Untapped Premium, a paid export, or Arena credentials.
 
 Current local findings:
 - Untapped's main process exposes the latest collection over `mtga.collection`.
 - Untapped's renderer can call that channel through `window.electron.ipcRenderer.invoke("mtga.collection.invoke")`.
 - Untapped also stores its settings in `~/Library/Application Support/untapped-companion/config.json`, and `showDevTools` can be toggled there.
 
-This gives us a practical manual test loop:
-1. enable Untapped DevTools
-2. dump the live `mtga.collection` map from the renderer console
-3. normalize the raw `grpId -> quantity` dump against Untapped's public MTGA catalog
-4. compare the normalized result against the CSV baseline
+The app now:
+
+1. detects the installed/running Companion app
+2. performs an explicit one-time restart with an ephemeral loopback-only DevTools port when required
+3. invokes `mtga.collection.invoke` through Companion's existing renderer bridge
+4. validates the bounded `grpId -> quantity` map and writes it atomically with mode `0600`
+5. normalizes the map against Untapped's public MTGA catalog
+6. previews the exact change set before any collection replacement
+7. binds confirmation to the capture's SHA-256 so a newer capture cannot be imported accidentally
+
+Use `Collection` → `Sync collection` in the web app. If Companion has not received a collection since it started, reconnect Arena or open its Collection/Decks view and retry.
+
+## Local Bridge API
+
+- `GET /api/imports/untapped-helper/status` reports installation, process, restart, and capture readiness.
+- `POST /api/imports/untapped-helper/restart` gracefully restarts Companion with local automation enabled.
+- `POST /api/imports/untapped-helper/capture-preview` captures and normalizes without changing the saved collection.
+- `POST /api/imports/untapped-helper/import-latest` requires the previewed capture ID plus explicit confirmation.
+
+## Manual Fallback
+
+The DevTools procedure below remains available if Companion changes in a way that breaks the automatic bridge.
 
 ## Step 1: Enable Untapped DevTools
 Run:
@@ -99,7 +117,8 @@ The current validated result is:
 and, critically, we want known edge cases like `Ajani's Pridemate` to resolve to `4`, not `16`.
 
 ## Known Limits
-- This is still a manual research path.
+
 - It depends on Untapped's live renderer and its current IPC contract.
-- It is suitable for validation and reverse-engineering, not for a shipped dependency.
+- It is suitable for this trusted personal workspace, not as a distributable first-party collector.
 - If `mtga.collection.invoke` returns `null`, MTGA is probably not in a scene where Untapped has populated the collection watcher yet.
+- Companion updates may change the renderer target or IPC contract; failures are surfaced without replacing the current collection.

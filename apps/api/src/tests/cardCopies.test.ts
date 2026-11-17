@@ -32,6 +32,15 @@ describe("deck copy helpers", () => {
     });
   });
 
+  it("leaves snow-covered basic lands uncapped", () => {
+    expect(getDeckBuildingLimit("", "Basic Snow Land — Island")).toBeNull();
+    expect(getOwnedCountView(20, "", "Basic Snow Land — Island")).toEqual({
+      rawOwnedCount: 20,
+      playableOwnedCount: 20,
+      deckBuildingLimit: null
+    });
+  });
+
   it("returns mechanic definitions for both derived and keyword mechanics", () => {
     expect(getMechanicDefinition("blink", "Blink", "derived")).toContain("exile and return");
     expect(getMechanicDefinition("flying", "Flying", "keyword")).toContain("blocked");

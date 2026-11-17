@@ -69,10 +69,6 @@ const buildOptionsForFile = (
     : {})
 });
 
-const debugInfoPlistExtension = {
-  SecTaskAccess: ["allowed", "debug"]
-};
-
 const readPackageVersion = () => {
   const payload = JSON.parse(readFileSync(resolve(packageRoot, "package.json"), "utf8")) as { version?: string };
   return payload.version ?? "0.1.0";
@@ -130,6 +126,11 @@ const ensureLocalElectronZip = (arch: PackageOptions["arch"], electronVersion: s
 };
 
 const main = async () => {
+  if (process.env.COLLECTOR_ALLOW_RESEARCH_PACKAGE !== "1") {
+    throw new Error(
+      "Collector packaging is release-gated until a bundled, owned/licensed, pre-signed reader is available. Set COLLECTOR_ALLOW_RESEARCH_PACKAGE=1 only for an explicit local research build."
+    );
+  }
   const options = parseArgs(process.argv.slice(2));
   ensureBuildPrerequisites();
   const electronVersion = resolveLocalElectronVersion();
@@ -144,8 +145,6 @@ const main = async () => {
     asar: true,
     dir: packageRoot,
     executableName: productName,
-    extendHelperInfo: debugInfoPlistExtension,
-    extendInfo: debugInfoPlistExtension,
     name: productName,
     out: outputDirectory,
     overwrite: true,

@@ -7,21 +7,30 @@ import { ARENA_FORMATS } from "../lib/formats.js";
 type ScryfallBulkIndex = {
   data: Array<{
     type: string;
-    download_uri: string;
+    download_uri?: string | null;
+    jsonl_download_uri?: string | null;
     updated_at?: string | null;
   }>;
+};
+
+type ScryfallBulkFormat = "json-array" | "jsonl-gzip";
+
+type ScryfallBulkDownloadSource = CardDataSyncSource & {
+  format: ScryfallBulkFormat;
 };
 
 type ScryfallCard = {
   id: string;
   oracle_id?: string | null;
   arena_id?: number | null;
+  lang?: string | null;
   name: string;
   oracle_text?: string | null;
   mana_cost?: string | null;
   cmc?: number | null;
   colors?: readonly string[] | null;
   color_identity?: readonly string[] | null;
+  produced_mana?: readonly string[] | null;
   type_line?: string | null;
   rarity?: string | null;
   layout?: string | null;
@@ -31,6 +40,7 @@ type ScryfallCard = {
   card_faces?: ReadonlyArray<{
     image_uris?: Record<string, string> | null;
     oracle_text?: string | null;
+    produced_mana?: readonly string[] | null;
   }> | null;
   set?: string | null;
   collector_number?: string | null;
@@ -47,6 +57,7 @@ type NormalizedCard = {
   manaValue: number;
   colors: string[];
   colorIdentity: string[];
+  producedMana: string[];
   typeLine: string;
   rarity: string;
   layout: string;
@@ -57,6 +68,7 @@ type NormalizedCard = {
     arenaId: number | null;
     setCode: string;
     collectorNumber: string | null;
+    rarity: string;
     games: string[];
     imageUrl: string | null;
     releasedAt: string | null;
@@ -79,6 +91,12 @@ export type CardDataSyncMetadata = CardDataSyncSource & {
   syncedAt: string;
   cardCount: number;
   printCount: number;
+};
+
+export type CardCatalogSyncOptions = {
+  scryfallFile?: string;
+  mtgJsonFile?: string;
+  skipMtgJson?: boolean;
 };
 
 const SCRYFALL_BULK_INDEX_URL = "https://api.scryfall.com/bulk-data";
@@ -133,6 +151,13 @@ const getImageUrl = (card: ScryfallCard) =>
   card.card_faces?.[0]?.image_uris?.normal ??
   card.card_faces?.[0]?.image_uris?.large ??
   null;
+
+const getProducedMana = (card: ScryfallCard) => [
+  ...new Set([
+    ...(card.produced_mana ?? []),
+    ...(card.card_faces?.flatMap((face) => face.produced_mana ?? []) ?? [])
+  ])
+];
 
 const readJsonArrayStream = async <T>(stream: ReadableStream<Uint8Array>) => {
   const reader = stream.getReader();
@@ -236,12 +261,111 @@ const readJsonArrayStream = async <T>(stream: ReadableStream<Uint8Array>) => {
   return items;
 };
 
+const readJsonLinesStream = async <T>(stream: ReadableStream<Uint8Array>) => {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  const items: T[] = [];
+  let buffer = "";
+
+  const readText = (text: string) => {
+    buffer += text;
+
+    while (true) {
+      const newlineIndex = buffer.indexOf("\n");
+      if (newlineIndex < 0) {
+        return;
+      }
+
+      const line = buffer.slice(0, newlineIndex).trim();
+      buffer = buffer.slice(newlineIndex + 1);
+      if (line) {
+        items.push(JSON.parse(line) as T);
+      }
+    }
+  };
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) {
+      break;
+    }
+    readText(decoder.decode(value, { stream: true }));
+  }
+
+  readText(decoder.decode());
+  const finalLine = buffer.trim();
+  if (finalLine) {
+    items.push(JSON.parse(finalLine) as T);
+  }
+
+  return items;
+};
+
 const isArenaPlayableCard = (card: ScryfallCard) => {
   const hasArenaGame = card.games?.includes("arena") ?? false;
   const hasArenaId = typeof card.arena_id === "number";
   const legalities = normalizeLegalities(card.legalities);
   const hasArenaFormatLegality = ARENA_FORMATS.some((format) => legalities[format] !== "not_legal");
   return hasArenaGame || hasArenaId || hasArenaFormatLegality;
+};
+
+const preferDatabasePrint = (candidate: ScryfallCard, current: ScryfallCard) => {
+  const candidatePriorities = [
+    typeof candidate.arena_id === "number",
+    candidate.games?.includes("arena") ?? false,
+    candidate.lang === "en",
+    Boolean(getImageUrl(candidate))
+  ];
+  const currentPriorities = [
+    typeof current.arena_id === "number",
+    current.games?.includes("arena") ?? false,
+    current.lang === "en",
+    Boolean(getImageUrl(current))
+  ];
+
+  for (let index = 0; index < candidatePriorities.length; index += 1) {
+    if (candidatePriorities[index] !== currentPriorities[index]) {
+      return candidatePriorities[index];
+    }
+  }
+
+  return candidate.id.localeCompare(current.id) < 0;
+};
+
+const deduplicateDatabasePrints = (cards: ScryfallCard[]) => {
+  const deduplicated: ScryfallCard[] = [];
+  const indexByDatabaseKey = new Map<string, number>();
+
+  for (const card of cards) {
+    if (!isArenaPlayableCard(card)) {
+      continue;
+    }
+
+    const collectorNumber = card.collector_number ?? null;
+    if (collectorNumber === null) {
+      deduplicated.push(card);
+      continue;
+    }
+
+    const databaseKey = JSON.stringify([
+      card.oracle_id ?? card.id,
+      (card.set ?? "").toUpperCase(),
+      collectorNumber
+    ]);
+    const existingIndex = indexByDatabaseKey.get(databaseKey);
+    if (existingIndex === undefined) {
+      indexByDatabaseKey.set(databaseKey, deduplicated.length);
+      deduplicated.push(card);
+      continue;
+    }
+
+    const existing = deduplicated[existingIndex];
+    if (existing && preferDatabasePrint(card, existing)) {
+      deduplicated[existingIndex] = card;
+    }
+  }
+
+  return deduplicated;
 };
 
 export const collectArenaRelevantSetCodes = (cards: ScryfallCard[]) => {
@@ -381,11 +505,7 @@ export const syncCardsFromBulkData = (
   const grouped = new Map<string, NormalizedCard>();
   const seenArenaIds = new Set<number>();
 
-  for (const card of cards) {
-    if (!isArenaPlayableCard(card)) {
-      continue;
-    }
-
+  for (const card of deduplicateDatabasePrints(cards)) {
     const cardId = card.oracle_id ?? card.id;
     const existing = grouped.get(cardId);
     const nextArenaId = typeof card.arena_id === "number" ? card.arena_id : null;
@@ -400,6 +520,7 @@ export const syncCardsFromBulkData = (
       arenaId: uniqueArenaId,
       setCode: (card.set ?? "").toUpperCase(),
       collectorNumber: card.collector_number ?? null,
+      rarity: card.rarity ?? "",
       games: Array.from(card.games ?? []),
       imageUrl: getImageUrl(card),
       releasedAt: card.released_at ?? null
@@ -415,6 +536,7 @@ export const syncCardsFromBulkData = (
         manaValue: card.cmc ?? 0,
         colors: Array.from(card.colors ?? []),
         colorIdentity: Array.from(card.color_identity ?? []),
+        producedMana: getProducedMana(card),
         typeLine: card.type_line ?? "",
         rarity: card.rarity ?? "",
         layout: card.layout ?? "",
@@ -430,6 +552,9 @@ export const syncCardsFromBulkData = (
     }
 
     existing.prints.push(print);
+    existing.producedMana = [
+      ...new Set([...existing.producedMana, ...getProducedMana(card)])
+    ];
     const preferredPrint = choosePreferredPrint(existing.prints) ?? print;
     existing.imageUrl = preferredPrint.imageUrl;
     existing.preferredSetCode = preferredPrint.setCode;
@@ -441,11 +566,11 @@ export const syncCardsFromBulkData = (
     const upsertCard = db.prepare(`
       INSERT INTO cards (
         id, oracle_id, name, normalized_name, oracle_text, mana_cost, mana_value,
-        colors_json, color_identity_json, type_line, rarity, layout, keywords_json,
+        colors_json, color_identity_json, produced_mana_json, type_line, rarity, layout, keywords_json,
         legalities_json, image_url, preferred_set_code, preferred_collector_number, released_at
       ) VALUES (
         @id, @oracleId, @name, @normalizedName, @oracleText, @manaCost, @manaValue,
-        @colorsJson, @colorIdentityJson, @typeLine, @rarity, @layout, @keywordsJson,
+        @colorsJson, @colorIdentityJson, @producedManaJson, @typeLine, @rarity, @layout, @keywordsJson,
         @legalitiesJson, @imageUrl, @preferredSetCode, @preferredCollectorNumber, @releasedAt
       )
       ON CONFLICT(id) DO UPDATE SET
@@ -457,6 +582,7 @@ export const syncCardsFromBulkData = (
         mana_value = excluded.mana_value,
         colors_json = excluded.colors_json,
         color_identity_json = excluded.color_identity_json,
+        produced_mana_json = excluded.produced_mana_json,
         type_line = excluded.type_line,
         rarity = excluded.rarity,
         layout = excluded.layout,
@@ -488,9 +614,9 @@ export const syncCardsFromBulkData = (
     `);
     const insertPrint = db.prepare(`
       INSERT INTO card_prints (
-        print_id, card_id, arena_id, set_code, collector_number, games_json, image_url, released_at
+        print_id, card_id, arena_id, set_code, collector_number, rarity, games_json, image_url, released_at
       ) VALUES (
-        @printId, @cardId, @arenaId, @setCode, @collectorNumber, @gamesJson, @imageUrl, @releasedAt
+        @printId, @cardId, @arenaId, @setCode, @collectorNumber, @rarity, @gamesJson, @imageUrl, @releasedAt
       )
     `);
 
@@ -523,6 +649,7 @@ export const syncCardsFromBulkData = (
         manaValue: card.manaValue,
         colorsJson: JSON.stringify(card.colors),
         colorIdentityJson: JSON.stringify(card.colorIdentity),
+        producedManaJson: JSON.stringify(card.producedMana),
         typeLine: card.typeLine,
         rarity: card.rarity,
         layout: card.layout,
@@ -593,17 +720,49 @@ export const fetchBulkData = async (customDownloadUri?: string): Promise<Scryfal
   return cards;
 };
 
+export const syncCardCatalog = async (
+  db: DbHandle,
+  options: CardCatalogSyncOptions = {}
+) => {
+  const bulkData = options.scryfallFile
+    ? {
+        cards: await readBulkDataFromFile(options.scryfallFile),
+        source: {
+          source: SCRYFALL_DEFAULT_CARDS_SOURCE,
+          sourceUpdatedAt: null,
+          downloadUri: options.scryfallFile
+        }
+      }
+    : await fetchBulkDataWithMetadata();
+  const mtgJsonSetCodes = options.skipMtgJson
+    ? []
+    : collectArenaRelevantSetCodes(bulkData.cards);
+  const mtgJsonIdentifiers = options.skipMtgJson
+    ? undefined
+    : options.mtgJsonFile
+      ? await readMtgJsonAllIdentifiersFromFile(options.mtgJsonFile)
+      : await fetchMtgJsonSetIdentifiersForCards(bulkData.cards);
+
+  return {
+    ...syncCardsFromBulkData(db, bulkData.cards, mtgJsonIdentifiers, bulkData.source),
+    mtgJsonSetCount: mtgJsonSetCodes.length
+  };
+};
+
 export const fetchBulkDataWithMetadata = async (
   customDownloadUri?: string
 ): Promise<{ cards: ScryfallCard[]; source: CardDataSyncSource }> => {
-  const source = customDownloadUri
+  const downloadSource: ScryfallBulkDownloadSource = customDownloadUri
     ? {
         source: SCRYFALL_DEFAULT_CARDS_SOURCE,
         sourceUpdatedAt: null,
-        downloadUri: customDownloadUri
+        downloadUri: customDownloadUri,
+        format: customDownloadUri.toLowerCase().includes(".jsonl.gz")
+          ? "jsonl-gzip"
+          : "json-array"
       }
     : await fetchBulkDownloadSource();
-  const downloadUri = source.downloadUri;
+  const downloadUri = downloadSource.downloadUri;
   if (!downloadUri) {
     throw new Error("Scryfall bulk data source did not include a download URI");
   }
@@ -621,13 +780,25 @@ export const fetchBulkDataWithMetadata = async (
     throw new Error("Scryfall bulk cards response did not include a body");
   }
 
+  const cards =
+    downloadSource.format === "jsonl-gzip"
+      ? await readJsonLinesStream<ScryfallCard>(
+          response.body.pipeThrough(new DecompressionStream("gzip"))
+        )
+      : await readJsonArrayStream<ScryfallCard>(response.body);
+  const source: CardDataSyncSource = {
+    source: downloadSource.source,
+    sourceUpdatedAt: downloadSource.sourceUpdatedAt,
+    downloadUri: downloadSource.downloadUri
+  };
+
   return {
-    cards: await readJsonArrayStream<ScryfallCard>(response.body),
+    cards,
     source
   };
 };
 
-const fetchBulkDownloadSource = async (): Promise<CardDataSyncSource> => {
+const fetchBulkDownloadSource = async (): Promise<ScryfallBulkDownloadSource> => {
   const response = await fetch(SCRYFALL_BULK_INDEX_URL, {
     headers: {
       "User-Agent": "mtga-collection-explorer/0.1",
@@ -644,10 +815,14 @@ const fetchBulkDownloadSource = async (): Promise<CardDataSyncSource> => {
   if (!defaultCards) {
     throw new Error("Scryfall bulk index did not include default_cards");
   }
+
+  const jsonLinesDownloadUri = defaultCards.jsonl_download_uri?.trim() || null;
+  const legacyDownloadUri = defaultCards.download_uri?.trim() || null;
   return {
     source: SCRYFALL_DEFAULT_CARDS_SOURCE,
     sourceUpdatedAt: defaultCards.updated_at ?? null,
-    downloadUri: defaultCards.download_uri
+    downloadUri: jsonLinesDownloadUri ?? legacyDownloadUri,
+    format: jsonLinesDownloadUri ? "jsonl-gzip" : "json-array"
   };
 };
 

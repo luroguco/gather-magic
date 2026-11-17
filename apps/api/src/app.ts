@@ -1,382 +1,193 @@
-import Fastify from "fastify";
+import { timingSafeEqual } from "node:crypto";
+
 import cors from "@fastify/cors";
 import multipart from "@fastify/multipart";
-import { z } from "zod";
+import Fastify from "fastify";
+import { ZodError } from "zod";
+
 import { createDatabase, type DbHandle } from "./lib/database.js";
-import { ARENA_FORMATS } from "./lib/formats.js";
-import { importCollectionCsv } from "./services/collectionImport.js";
-import {
-  CARD_DRILLDOWN_KINDS,
-  getCardById,
-  getCardDataSyncSummary,
-  getCardStats,
-  getCollectionSummary,
-  listMechanics,
-  searchCards,
-  type SearchFilters
-} from "./services/cardsRepository.js";
-import { createDeck, exportDeckForArena, getDeck, listDecks, updateDeck, validateDeck } from "./services/decks.js";
-import {
-  UNTAPPED_CAPTURE_SNIPPET,
-  getUntappedCaptureStatus,
-  readLatestUntappedCapture,
-  setUntappedDevToolsEnabled
-} from "./services/untappedCaptureHelper.js";
-import {
-  captureCollectorSnapshot,
-  getCollectorCaptureStatus,
-  readLatestCollectorSnapshot,
-  type CollectorCaptureHelperOptions
-} from "./services/mtgaCollectorHelper.js";
-import {
-  importCollectorSnapshotJson,
-  importUntappedCollectionJson,
-  previewCollectorSnapshotImport,
-  previewUntappedCollectionImport,
-  type UntappedCatalogSource
-} from "./services/untappedCollectionImport.js";
+import { registerCaptureRoutes } from "./modules/capture/routes.js";
+import { registerCardRoutes } from "./modules/cards/routes.js";
+import { registerCoachRoutes } from "./modules/coach/routes.js";
+import { registerCollectionRoutes } from "./modules/collection/routes.js";
+import { registerDeckRoutes } from "./modules/decks/routes.js";
+import { registerSystemRoutes } from "./modules/system/routes.js";
+import type { CollectorCaptureHelperOptions } from "./services/mtgaCollectorHelper.js";
+import type { syncCardCatalog } from "./services/cardData.js";
+import type { UntappedCompanionBridgeOptions } from "./services/untappedCompanionBridge.js";
+import type { UntappedCatalogSource } from "./services/untappedCollectionImport.js";
 
-const MAX_SEARCH_PAGE_SIZE = 50_000;
+const DEFAULT_ALLOWED_ORIGINS = [
+  "http://localhost:5173",
+  "http://127.0.0.1:5173"
+];
+const DEFAULT_ALLOWED_HOSTS = ["localhost", "127.0.0.1", "::1"];
+const LOOPBACK_ORIGIN_HOSTS = new Set(DEFAULT_ALLOWED_HOSTS);
+const MAX_MULTIPART_FILE_SIZE = 5 * 1024 * 1024;
 
-const searchQuerySchema = z.object({
-  q: z.string().optional(),
-  format: z.enum(ARENA_FORMATS).optional(),
-  colors: z.string().optional(),
-  mechanics: z.string().optional(),
-  types: z.string().optional(),
-  subtypes: z.string().optional(),
-  rarity: z.string().optional(),
-  sets: z.string().optional(),
-  drilldownKind: z.enum(CARD_DRILLDOWN_KINDS).optional(),
-  drilldownKey: z.string().optional(),
-  ownedOnly: z
-    .string()
-    .optional()
-    .transform((value) => value === "true"),
-  playableCountMin: z
-    .string()
-    .optional()
-    .transform((value) => (value ? Number.parseFloat(value) : undefined)),
-  playableCountMax: z
-    .string()
-    .optional()
-    .transform((value) => (value ? Number.parseFloat(value) : undefined)),
-  manaValueMin: z
-    .string()
-    .optional()
-    .transform((value) => (value ? Number.parseFloat(value) : undefined)),
-  manaValueMax: z
-    .string()
-    .optional()
-    .transform((value) => (value ? Number.parseFloat(value) : undefined)),
-  page: z
-    .string()
-    .optional()
-    .transform((value) => (value ? Number.parseInt(value, 10) : 1)),
-  pageSize: z
-    .string()
-    .optional()
-    .transform((value) => (value ? Math.min(Number.parseInt(value, 10), MAX_SEARCH_PAGE_SIZE) : MAX_SEARCH_PAGE_SIZE))
-});
+const isLoopbackDevelopmentOrigin = (origin: string) => {
+  try {
+    const parsed = new URL(origin);
+    return parsed.protocol === "http:" && LOOPBACK_ORIGIN_HOSTS.has(parsed.hostname);
+  } catch {
+    return false;
+  }
+};
 
-const mechanicsQuerySchema = z.object({
-  ownedOnly: z
-    .string()
-    .optional()
-    .transform((value) => value === "true")
-});
+export type BuildAppOptions = {
+  untappedCatalogSource?: UntappedCatalogSource;
+  collectorCatalogSource?: UntappedCatalogSource;
+  untappedBuild?: string;
+  untappedLocale?: string;
+  untappedConfigPath?: string;
+  untappedDownloadsPath?: string;
+  untappedCapturePath?: string;
+  arenaPlayerLogPath?: string;
+  arenaDeckCatalogSource?: UntappedCatalogSource;
+  untappedBridgeOptions?: UntappedCompanionBridgeOptions;
+  collectorHelperOptions?: CollectorCaptureHelperOptions;
+  directCaptureEnabled?: boolean;
+  experimentalCaptureEnabled?: boolean;
+  allowedOrigins?: string[];
+  allowedHosts?: string[];
+  localApiToken?: string;
+  cardCatalogSync?: typeof syncCardCatalog;
+};
 
-const deckCardSchema = z.object({
-  cardId: z.string().min(1),
-  quantity: z.number().int().positive(),
-  section: z.enum(["main", "sideboard", "commander"])
-});
-
-const createDeckSchema = z.object({
-  name: z.string().min(1),
-  format: z.enum(ARENA_FORMATS),
-  notes: z.string().optional().default(""),
-  cards: z.array(deckCardSchema).optional()
-});
-
-const updateDeckSchema = z.object({
-  name: z.string().min(1).optional(),
-  format: z.enum(ARENA_FORMATS).optional(),
-  notes: z.string().optional(),
-  cards: z.array(deckCardSchema).optional()
-});
-
-const splitCsvParam = (value?: string) =>
-  value?.split(",").map((entry) => entry.trim()).filter(Boolean) ?? undefined;
-
-type SearchQuery = z.infer<typeof searchQuerySchema>;
-
-const mapSearchQueryToFilters = (query: SearchQuery): SearchFilters => ({
-  q: query.q,
-  format: query.format,
-  colors: splitCsvParam(query.colors),
-  mechanics: splitCsvParam(query.mechanics),
-  types: splitCsvParam(query.types),
-  subtypes: splitCsvParam(query.subtypes),
-  rarity: splitCsvParam(query.rarity),
-  sets: splitCsvParam(query.sets),
-  drilldownKind: query.drilldownKind,
-  drilldownKey: query.drilldownKey,
-  ownedOnly: query.ownedOnly,
-  playableCountMin: query.playableCountMin,
-  playableCountMax: query.playableCountMax,
-  manaValueMin: query.manaValueMin,
-  manaValueMax: query.manaValueMax,
-  page: query.page,
-  pageSize: query.pageSize
-});
+const tokenMatches = (expected: string, actual: string | undefined) => {
+  if (!actual?.startsWith("Bearer ")) {
+    return false;
+  }
+  const actualToken = actual.slice("Bearer ".length);
+  const expectedBuffer = Buffer.from(expected);
+  const actualBuffer = Buffer.from(actualToken);
+  return (
+    expectedBuffer.length === actualBuffer.length &&
+    timingSafeEqual(expectedBuffer, actualBuffer)
+  );
+};
 
 export const buildApp = (
   db: DbHandle = createDatabase(),
-  options?: {
-    untappedCatalogSource?: UntappedCatalogSource;
-    untappedBuild?: string;
-    untappedLocale?: string;
-    untappedConfigPath?: string;
-    untappedDownloadsPath?: string;
-    collectorHelperOptions?: CollectorCaptureHelperOptions;
-  }
+  options: BuildAppOptions = {}
 ) => {
   const app = Fastify({
-    logger: false
+    logger: false,
+    bodyLimit: MAX_MULTIPART_FILE_SIZE
   });
-  const untappedImportOptions = {
-    catalogSource: options?.untappedCatalogSource ?? "untapped-public",
-    ...(options?.untappedBuild ? { untappedBuild: options.untappedBuild } : {}),
-    ...(options?.untappedLocale ? { untappedLocale: options.untappedLocale } : {})
-  };
-  const untappedHelperOptions = {
-    ...(options?.untappedConfigPath ? { configPath: options.untappedConfigPath } : {}),
-    ...(options?.untappedDownloadsPath ? { downloadsPath: options.untappedDownloadsPath } : {})
-  };
-  const collectorHelperOptions = options?.collectorHelperOptions;
+  const allowedOrigins = options.allowedOrigins ?? DEFAULT_ALLOWED_ORIGINS;
+  const isAllowedOrigin = (origin: string) =>
+    allowedOrigins.includes(origin) ||
+    (options.allowedOrigins === undefined && isLoopbackDevelopmentOrigin(origin));
+  const allowedHosts = new Set(options.allowedHosts ?? DEFAULT_ALLOWED_HOSTS);
+  const untappedCatalogSource = options.untappedCatalogSource ?? "untapped-public";
+  const collectorCatalogSource = options.collectorCatalogSource ?? "hybrid";
+  const directCaptureEnabled =
+    options.directCaptureEnabled ?? options.experimentalCaptureEnabled ?? false;
 
   app.register(cors, {
-    origin: true
+    origin: (origin, callback) => {
+      callback(null, !origin || isAllowedOrigin(origin));
+    },
+    methods: ["GET", "POST", "PATCH", "OPTIONS"]
   });
-  app.register(multipart);
-
-  app.get("/api/health", async () => ({
-    ok: true
-  }));
-
-  app.get("/api/status", async () => ({
-    collection: getCollectionSummary(db),
-    cards: db.prepare("SELECT COUNT(*) AS total FROM cards").get(),
-    cardData: getCardDataSyncSummary(db)
-  }));
-
-  app.get("/api/mechanics", async (request) => {
-    const query = mechanicsQuerySchema.parse(request.query);
-    return {
-      items: listMechanics(db, {
-        ownedOnly: query.ownedOnly
-      })
-    };
-  });
-
-  app.get("/api/cards/search", async (request) => {
-    const query = searchQuerySchema.parse(request.query);
-    return searchCards(db, mapSearchQueryToFilters(query));
-  });
-
-  app.get("/api/stats/cards", async (request) => {
-    const query = searchQuerySchema.parse(request.query);
-    return getCardStats(db, mapSearchQueryToFilters(query));
-  });
-
-  app.get("/api/cards/:id", async (request, reply) => {
-    const params = z.object({ id: z.string() }).parse(request.params);
-    const card = getCardById(db, params.id);
-    if (!card) {
-      reply.code(404);
-      return { error: "Card not found" };
+  app.register(multipart, {
+    limits: {
+      files: 1,
+      fileSize: MAX_MULTIPART_FILE_SIZE,
+      fields: 5
     }
-    return card;
   });
 
-  app.post("/api/imports/collection-csv", async (request, reply) => {
-    const file = await request.file();
-    if (!file) {
-      reply.code(400);
-      return { error: "Expected a multipart file field." };
-    }
-    const csvContent = await file.toBuffer();
-    const result = importCollectionCsv(db, csvContent.toString("utf8"));
-    return result;
-  });
-
-  app.post("/api/imports/collector-snapshot/preview", async (request, reply) => {
-    const file = await request.file();
-    if (!file) {
-      reply.code(400);
-      return { error: "Expected a multipart file field." };
+  app.addHook("onRequest", async (request, reply) => {
+    if (!allowedHosts.has(request.hostname)) {
+      return reply.code(403).send({ error: "Unrecognized API host." });
     }
 
-    const jsonContent = await file.toBuffer();
-    return previewCollectorSnapshotImport(db, jsonContent.toString("utf8"), untappedImportOptions);
-  });
-
-  app.post("/api/imports/collector-snapshot", async (request, reply) => {
-    const file = await request.file();
-    if (!file) {
-      reply.code(400);
-      return { error: "Expected a multipart file field." };
+    const origin = request.headers.origin;
+    if (origin && !isAllowedOrigin(origin)) {
+      return reply.code(403).send({ error: "Origin is not allowed." });
     }
 
-    const jsonContent = await file.toBuffer();
-    return importCollectorSnapshotJson(db, jsonContent.toString("utf8"), untappedImportOptions);
+    if (
+      options.localApiToken &&
+      request.url !== "/api/health" &&
+      request.method !== "OPTIONS" &&
+      !tokenMatches(options.localApiToken, request.headers.authorization)
+    ) {
+      return reply.code(401).send({ error: "A valid local API token is required." });
+    }
   });
 
-  app.get("/api/imports/collector-helper/status", async () => getCollectorCaptureStatus(collectorHelperOptions));
-
-  app.post("/api/imports/collector-helper/capture-preview", async () => {
-    const { capture, content } = await captureCollectorSnapshot(collectorHelperOptions);
-    const preview = await previewCollectorSnapshotImport(db, content, untappedImportOptions);
-
-    return {
-      ...preview,
-      capture
-    };
-  });
-
-  app.post("/api/imports/collector-helper/preview-latest", async () => {
-    const { capture, content } = readLatestCollectorSnapshot(collectorHelperOptions);
-    const preview = await previewCollectorSnapshotImport(db, content, untappedImportOptions);
-
-    return {
-      ...preview,
-      capture
-    };
-  });
-
-  app.post("/api/imports/collector-helper/import-latest", async () => {
-    const { capture, content } = readLatestCollectorSnapshot(collectorHelperOptions);
-    const imported = await importCollectorSnapshotJson(db, content, untappedImportOptions);
-
-    return {
-      ...imported,
-      capture
-    };
-  });
-
-  app.post("/api/imports/untapped-json/preview", async (request, reply) => {
-    const file = await request.file();
-    if (!file) {
-      reply.code(400);
-      return { error: "Expected a multipart file field." };
+  app.setErrorHandler((error, _request, reply) => {
+    if (error instanceof ZodError) {
+      return reply.code(400).send({
+        error: "Invalid request.",
+        issues: error.issues.map((issue) => ({
+          path: issue.path.join("."),
+          message: issue.message
+        }))
+      });
     }
 
-    const jsonContent = await file.toBuffer();
-    return previewUntappedCollectionImport(db, jsonContent.toString("utf8"), untappedImportOptions);
+    const statusCode =
+      typeof (error as { statusCode?: unknown }).statusCode === "number"
+        ? (error as { statusCode: number }).statusCode
+        : 500;
+    const errorCode =
+      typeof (error as { code?: unknown }).code === "string"
+        ? (error as { code: string }).code
+        : undefined;
+    return reply.code(statusCode).send({
+      error:
+        statusCode >= 500 && !errorCode
+          ? "Request failed."
+          : error instanceof Error
+            ? error.message
+            : "Request failed.",
+      ...(errorCode ? { code: errorCode } : {})
+    });
   });
 
-  app.post("/api/imports/untapped-json", async (request, reply) => {
-    const file = await request.file();
-    if (!file) {
-      reply.code(400);
-      return { error: "Expected a multipart file field." };
-    }
-
-    const jsonContent = await file.toBuffer();
-    return importUntappedCollectionJson(db, jsonContent.toString("utf8"), untappedImportOptions);
+  registerSystemRoutes(app, db);
+  registerCardRoutes(app, db);
+  registerCoachRoutes(app, db);
+  registerCollectionRoutes(app, db, {
+    untappedCatalogSource,
+    collectorCatalogSource,
+    ...(options.untappedBuild ? { untappedBuild: options.untappedBuild } : {}),
+    ...(options.untappedLocale ? { untappedLocale: options.untappedLocale } : {})
   });
-
-  app.get("/api/imports/untapped-helper/status", async () => ({
-    ...getUntappedCaptureStatus(untappedHelperOptions),
-    snippet: UNTAPPED_CAPTURE_SNIPPET
-  }));
-
-  app.post("/api/imports/untapped-helper/start", async () => {
-    const result = setUntappedDevToolsEnabled(true, untappedHelperOptions);
-    return {
-      changed: result.changed,
-      status: result.status,
-      snippet: UNTAPPED_CAPTURE_SNIPPET
-    };
+  registerCaptureRoutes(app, db, {
+    enabled: directCaptureEnabled,
+    untappedCatalogSource,
+    collectorCatalogSource,
+    ...(options.untappedBuild ? { untappedBuild: options.untappedBuild } : {}),
+    ...(options.untappedLocale ? { untappedLocale: options.untappedLocale } : {}),
+    ...(options.untappedConfigPath ? { untappedConfigPath: options.untappedConfigPath } : {}),
+    ...(options.untappedDownloadsPath
+      ? { untappedDownloadsPath: options.untappedDownloadsPath }
+      : {}),
+    ...(options.untappedCapturePath
+      ? { untappedCapturePath: options.untappedCapturePath }
+      : {}),
+    ...(options.untappedBridgeOptions
+      ? { untappedBridgeOptions: options.untappedBridgeOptions }
+      : {}),
+    ...(options.collectorHelperOptions
+      ? { collectorHelperOptions: options.collectorHelperOptions }
+      : {}),
+    ...(options.cardCatalogSync
+      ? { cardCatalogSync: options.cardCatalogSync }
+      : {})
   });
-
-  app.post("/api/imports/untapped-helper/stop", async () => {
-    const result = setUntappedDevToolsEnabled(false, untappedHelperOptions);
-    return {
-      changed: result.changed,
-      status: result.status
-    };
-  });
-
-  app.post("/api/imports/untapped-helper/preview-latest", async () => {
-    const { capture, content } = readLatestUntappedCapture(untappedHelperOptions);
-    const preview = await previewUntappedCollectionImport(db, content, untappedImportOptions);
-
-    return {
-      ...preview,
-      capture
-    };
-  });
-
-  app.post("/api/imports/untapped-helper/import-latest", async () => {
-    const { capture, content } = readLatestUntappedCapture(untappedHelperOptions);
-    const imported = await importUntappedCollectionJson(db, content, untappedImportOptions);
-
-    return {
-      ...imported,
-      capture
-    };
-  });
-
-  app.get("/api/decks", async () => ({
-    items: listDecks(db)
-  }));
-
-  app.post("/api/decks", async (request) => {
-    const input = createDeckSchema.parse(request.body);
-    return createDeck(db, input);
-  });
-
-  app.get("/api/decks/:id", async (request, reply) => {
-    const params = z.object({ id: z.string() }).parse(request.params);
-    const deck = getDeck(db, params.id);
-    if (!deck) {
-      reply.code(404);
-      return { error: "Deck not found" };
-    }
-    return deck;
-  });
-
-  app.patch("/api/decks/:id", async (request, reply) => {
-    const params = z.object({ id: z.string() }).parse(request.params);
-    const input = updateDeckSchema.parse(request.body);
-    const deck = updateDeck(db, params.id, input);
-    if (!deck) {
-      reply.code(404);
-      return { error: "Deck not found" };
-    }
-    return deck;
-  });
-
-  app.post("/api/decks/:id/validate", async (request, reply) => {
-    const params = z.object({ id: z.string() }).parse(request.params);
-    const validation = validateDeck(db, params.id);
-    if (!validation) {
-      reply.code(404);
-      return { error: "Deck not found" };
-    }
-    return validation;
-  });
-
-  app.get("/api/decks/:id/export/arena", async (request, reply) => {
-    const params = z.object({ id: z.string() }).parse(request.params);
-    const exportPayload = exportDeckForArena(db, params.id);
-    if (!exportPayload) {
-      reply.code(404);
-      return { error: "Deck not found" };
-    }
-    return exportPayload;
+  registerDeckRoutes(app, db, {
+    catalogSource: options.arenaDeckCatalogSource ?? collectorCatalogSource,
+    ...(options.arenaPlayerLogPath
+      ? { playerLogPath: options.arenaPlayerLogPath }
+      : {}),
+    ...(options.untappedBuild ? { untappedBuild: options.untappedBuild } : {}),
+    ...(options.untappedLocale ? { untappedLocale: options.untappedLocale } : {})
   });
 
   return app;

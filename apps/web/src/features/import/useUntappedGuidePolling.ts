@@ -1,10 +1,15 @@
 import { useEffect, type Dispatch, type SetStateAction } from "react";
 
 import { getUntappedHelperStatus, previewLatestUntappedCapture } from "../../api";
-import type { UntappedCaptureFile, UntappedCaptureStatus, UntappedImportSummary } from "../../types";
+import type {
+  UntappedCaptureFile,
+  UntappedCaptureImportSummary,
+  UntappedCaptureStatus,
+  UntappedImportSummary
+} from "../../types";
 
 const getUntappedCaptureIdentity = (capture: UntappedCaptureFile | null) =>
-  capture ? `${capture.path}::${capture.modifiedAt}` : null;
+  capture?.id ?? null;
 
 type UseUntappedGuidePollingArgs = {
   activeTab: "search" | "stats" | "decks" | "import";
@@ -15,7 +20,9 @@ type UseUntappedGuidePollingArgs = {
   setLastAutoPreviewedCaptureId: Dispatch<SetStateAction<string | null>>;
   setUntappedPreviewLoading: Dispatch<SetStateAction<boolean>>;
   setUntappedFile: Dispatch<SetStateAction<File | null>>;
-  setUntappedPreview: Dispatch<SetStateAction<UntappedImportSummary | null>>;
+  setUntappedPreview: Dispatch<
+    SetStateAction<UntappedImportSummary | UntappedCaptureImportSummary | null>
+  >;
   setUntappedPreviewSource: Dispatch<SetStateAction<"manual-file" | "latest-capture" | null>>;
   setImportMessage: Dispatch<SetStateAction<string>>;
   onError: (message: string) => void;

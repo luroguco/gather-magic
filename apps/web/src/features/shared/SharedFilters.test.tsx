@@ -15,7 +15,7 @@ const sampleMechanic: Mechanic = {
 };
 
 describe("SharedFilters", () => {
-  it("applies text and owned-only updates through the shared updater", () => {
+  it("applies text, format, and owned-only updates through the shared updater", () => {
     let state: FilterState = {
       ...defaultSearch,
       mechanics: ["flying"],
@@ -49,6 +49,10 @@ describe("SharedFilters", () => {
     fireEvent.change(screen.getByPlaceholderText("Search name or oracle text"), {
       target: { value: "angel" }
     });
+    expect(screen.getByRole("option", { name: "Any format" })).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Format"), {
+      target: { value: "" }
+    });
     fireEvent.click(screen.getByRole("checkbox"));
     fireEvent.click(screen.getByRole("button", { name: "Clear filters" }));
     const flyingButtons = screen.getAllByRole("button", { name: "Flying" });
@@ -56,8 +60,9 @@ describe("SharedFilters", () => {
     fireEvent.click(flyingButtons[0]!);
     fireEvent.click(screen.getByRole("button", { name: "Glossary" }));
 
-    expect(updateState).toHaveBeenCalledTimes(2);
+    expect(updateState).toHaveBeenCalledTimes(3);
     expect(state.q).toBe("angel");
+    expect(state.format).toBe("");
     expect(state.ownedOnly).toBe(false);
     expect(onClear).toHaveBeenCalledTimes(1);
     expect(onToggleMechanic).toHaveBeenCalledWith("flying");

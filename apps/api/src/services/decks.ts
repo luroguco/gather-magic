@@ -1,7 +1,15 @@
 import { randomUUID } from "node:crypto";
 import type { DbHandle } from "../lib/database.js";
-import { ARENA_FORMATS, BRAWL_FORMATS, type ArenaFormat, FORMAT_LABELS } from "../lib/formats.js";
+import {
+  DECK_FORMATS,
+  type DeckFormat
+} from "../lib/formats.js";
 import type { DeckCardInput, DeckRecord } from "../lib/types.js";
+import {
+  isBasicLand,
+  validateDeckCandidate,
+  type DeckRuleCardEntry
+} from "./deckRules.js";
 
 const validSections = new Set<DeckCardInput["section"]>(["main", "sideboard", "commander"]);
 
@@ -26,6 +34,12 @@ export const listDecks = (db: DbHandle) =>
       notes: String(row.notes),
       createdAt: String(row.created_at),
       updatedAt: String(row.updated_at),
+      source: String(row.source) as DeckRecord["source"],
+      externalId: row.external_id ? String(row.external_id) : null,
+      sourceFormat: row.source_format ? String(row.source_format) : null,
+      sourceUpdatedAt: row.source_updated_at ? String(row.source_updated_at) : null,
+      lastPlayedAt: row.last_played_at ? String(row.last_played_at) : null,
+      isFavorite: Number(row.is_favorite ?? 0) === 1,
       cardRows: Number(row.cardRows ?? 0),
       totalCards: Number(row.totalCards ?? 0)
     }));
@@ -66,25 +80,33 @@ export const getDeck = (db: DbHandle, deckId: string): DeckRecord | null => {
       typeLine: row.type_line ? String(row.type_line) : undefined,
       manaCost: row.mana_cost ? String(row.mana_cost) : undefined,
       manaValue: Number(row.mana_value ?? 0),
-      ownedCount: Number(row.owned_count ?? 0)
+      ownedCount: isBasicLand(String(row.type_line ?? ""))
+        ? null
+        : Number(row.owned_count ?? 0)
     }));
 
   return {
     id: String(deck.id),
     name: String(deck.name),
-    format: String(deck.format) as ArenaFormat,
+    format: String(deck.format) as DeckFormat,
     notes: String(deck.notes),
     createdAt: String(deck.created_at),
     updatedAt: String(deck.updated_at),
+    source: String(deck.source) as DeckRecord["source"],
+    externalId: deck.external_id ? String(deck.external_id) : null,
+    sourceFormat: deck.source_format ? String(deck.source_format) : null,
+    sourceUpdatedAt: deck.source_updated_at ? String(deck.source_updated_at) : null,
+    lastPlayedAt: deck.last_played_at ? String(deck.last_played_at) : null,
+    isFavorite: Number(deck.is_favorite ?? 0) === 1,
     cards: normalizedCards
   };
 };
 
-const assertFormat = (format: string): ArenaFormat => {
-  if (!ARENA_FORMATS.includes(format as ArenaFormat)) {
+const assertFormat = (format: string): DeckFormat => {
+  if (!DECK_FORMATS.includes(format as DeckFormat)) {
     throw new Error(`Unsupported format "${format}"`);
   }
-  return format as ArenaFormat;
+  return format as DeckFormat;
 };
 
 const sanitizeCards = (cards: DeckCardInput[]) =>
@@ -138,7 +160,7 @@ export const updateDeck = (
   deckId: string,
   input: {
     name?: string | undefined;
-    format?: ArenaFormat | undefined;
+    format?: DeckFormat | undefined;
     notes?: string | undefined;
     cards?: DeckCardInput[] | undefined;
   }
@@ -179,10 +201,17 @@ export const validateDeck = (db: DbHandle, deckId: string) => {
         `
         SELECT
           cards.name,
+          cards.normalized_name,
+          cards.oracle_text,
           cards.type_line,
-          cards.preferred_set_code,
-          cards.preferred_collector_number,
+          cards.color_identity_json,
           cards.legalities_json,
+          EXISTS (
+            SELECT 1
+            FROM card_prints
+            WHERE card_prints.card_id = cards.id
+              AND card_prints.games_json LIKE '%"arena"%'
+          ) AS available_on_arena,
           coalesce(collection_cards.count, 0) AS owned_count
         FROM cards
         LEFT JOIN collection_cards ON collection_cards.card_id = cards.id
@@ -192,10 +221,12 @@ export const validateDeck = (db: DbHandle, deckId: string) => {
       .get(entry.cardId) as
       | {
           name: string;
+          normalized_name: string;
+          oracle_text: string;
           type_line: string;
-          preferred_set_code: string | null;
-          preferred_collector_number: string | null;
+          color_identity_json: string;
           legalities_json: string;
+          available_on_arena: number;
           owned_count: number;
         }
       | undefined;
@@ -206,65 +237,57 @@ export const validateDeck = (db: DbHandle, deckId: string) => {
     };
   });
 
-  const issues: string[] = [];
-  const ownershipGaps = cards
-    .filter((entry) => entry.card)
-    .map((entry) => ({
-      cardId: entry.cardId,
-      name: entry.card!.name,
-      needed: entry.quantity,
-      owned: entry.card!.owned_count,
-      missing: Math.max(entry.quantity - entry.card!.owned_count, 0)
-    }))
-    .filter((entry) => entry.missing > 0);
-
-  const formatLabel = FORMAT_LABELS[deck.format];
-
-  for (const entry of cards) {
-    if (!entry.card) {
-      issues.push(`Card "${entry.cardId}" no longer exists in the local catalog.`);
-      continue;
+  const parseStringArray = (value: string) => {
+    try {
+      const parsed = JSON.parse(value) as unknown;
+      return Array.isArray(parsed)
+        ? parsed.filter((item): item is string => typeof item === "string")
+        : [];
+    } catch {
+      return [];
     }
-    const legalities = JSON.parse(entry.card.legalities_json) as Record<string, string>;
-    if (!["legal", "restricted"].includes(legalities[deck.format] ?? "not_legal")) {
-      issues.push(`${entry.card.name} is not ${formatLabel}-legal.`);
+  };
+  const parseStringRecord = (value: string) => {
+    try {
+      const parsed = JSON.parse(value) as unknown;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        return {};
+      }
+      return Object.fromEntries(
+        Object.entries(parsed).filter(
+          (entry): entry is [string, string] => typeof entry[1] === "string"
+        )
+      );
+    } catch {
+      return {};
     }
-  }
-
-  const mainCount = cards
-    .filter((entry) => entry.section === "main")
-    .reduce((total, entry) => total + entry.quantity, 0);
-  const commanderCount = cards
-    .filter((entry) => entry.section === "commander")
-    .reduce((total, entry) => total + entry.quantity, 0);
-
-  if (BRAWL_FORMATS.has(deck.format)) {
-    if (mainCount !== 59) {
-      issues.push(`${formatLabel} decks should contain 59 cards in the main deck.`);
-    }
-    if (commanderCount !== 1) {
-      issues.push(`${formatLabel} decks should contain exactly 1 commander.`);
-    }
-
-    const singletonViolations = cards
-      .filter((entry) => entry.section !== "sideboard")
-      .filter((entry) => {
-        const typeLine = entry.card?.type_line ?? "";
-        const isBasicLand = typeLine.includes("Basic Land");
-        return !isBasicLand && entry.quantity > 1;
-      });
-    for (const violation of singletonViolations) {
-      issues.push(`${violation.card?.name ?? violation.cardId} violates the singleton rule.`);
-    }
-  } else if (mainCount < 60) {
-    issues.push(`${formatLabel} decks should contain at least 60 main-deck cards.`);
-  }
+  };
+  const ruleEntries: DeckRuleCardEntry[] = cards.map((entry) => ({
+    cardId: entry.cardId,
+    quantity: entry.quantity,
+    section: entry.section,
+    name: entry.card?.name ?? null,
+    normalizedName: entry.card?.normalized_name,
+    oracleText: entry.card?.oracle_text,
+    typeLine: entry.card?.type_line,
+    colorIdentity: entry.card
+      ? parseStringArray(entry.card.color_identity_json)
+      : [],
+    legalities: entry.card ? parseStringRecord(entry.card.legalities_json) : {},
+    availableOnArena: entry.card
+      ? entry.card.available_on_arena === 1
+      : undefined,
+    ownedCount: entry.card?.owned_count ?? 0
+  }));
+  const validation = validateDeckCandidate(deck.format, ruleEntries);
 
   return {
     deckId: deck.id,
     format: deck.format,
-    issues,
-    ownershipGaps
+    issues: validation.issues.map((issue) => issue.message),
+    ownershipGaps: validation.ownershipGaps,
+    ruleIssues: validation.issues,
+    counts: validation.counts
   };
 };
 
@@ -274,7 +297,7 @@ export const exportDeckForArena = (db: DbHandle, deckId: string) => {
     return null;
   }
 
-  const lines: string[] = [deck.name, ""];
+  const lines: string[] = [];
 
   const sections: DeckCardInput["section"][] = ["commander", "main", "sideboard"];
 
@@ -286,6 +309,8 @@ export const exportDeckForArena = (db: DbHandle, deckId: string) => {
 
     if (section === "commander") {
       lines.push("Commander");
+    } else if (section === "main") {
+      lines.push("Deck");
     } else if (section === "sideboard") {
       lines.push("Sideboard");
     }
@@ -322,5 +347,24 @@ export const exportDeckForArena = (db: DbHandle, deckId: string) => {
     name: deck.name,
     format: deck.format,
     text: lines.join("\n").trim()
+  };
+};
+
+export const exportAllDecksForArena = (db: DbHandle) => {
+  const decks = listDecks(db).flatMap((deck) => {
+    const arenaExport = exportDeckForArena(db, deck.id);
+    return arenaExport ? [arenaExport] : [];
+  });
+  const text = decks
+    .map(
+      (deck) =>
+        `${"=".repeat(64)}\n${deck.name}\n${"=".repeat(64)}\n${deck.text}`
+    )
+    .join("\n\n");
+
+  return {
+    deckCount: decks.length,
+    decks,
+    text
   };
 };

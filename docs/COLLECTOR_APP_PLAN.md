@@ -1,5 +1,15 @@
 # MTGA Collector App Plan
 
+## July 2026 Architecture Update
+
+The Phase 0 Electron work remains useful research, but the Electron application is no longer the proposed privileged collector host. The release topology is now:
+
+- unprivileged desktop controller/UI
+- short-lived, pre-signed platform reader helper with minimal permissions
+- strict `collector-snapshot-v1` handoff
+
+The current runtime-signed Node path and private Untapped addon are validation probes only. Packaging is release-gated until an owned or explicitly licensed reader can be bundled, signed, notarized, and tested across supported MTGA builds. See `docs/ARCHITECTURE.md`.
+
 ## Goal
 
 Build a local desktop collector that can capture the MTG Arena collection directly, without:

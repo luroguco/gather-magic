@@ -1,8 +1,8 @@
-import type { Deck, Mechanic } from "../../types";
+import type { Mechanic } from "../../types";
 import {
   CARD_TYPES,
   COLORS,
-  FORMATS,
+  FORMAT_FILTER_OPTIONS,
   RARITIES,
   type FilterState,
   type FilterStateUpdater,
@@ -53,10 +53,15 @@ export function SharedFilters({
         <span>Format</span>
         <select
           value={state.format}
-          onChange={(event) => updateState((current) => ({ ...current, format: event.target.value as Deck["format"] }))}
+          onChange={(event) =>
+            updateState((current) => ({
+              ...current,
+              format: event.target.value as FilterState["format"]
+            }))
+          }
         >
-          {FORMATS.map(([value, label]) => (
-            <option key={value} value={value}>
+          {FORMAT_FILTER_OPTIONS.map(([value, label]) => (
+            <option key={value || "any-format"} value={value}>
               {label}
             </option>
           ))}

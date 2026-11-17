@@ -10,6 +10,13 @@ export const FORMATS = [
   ["standardbrawl", "Standard Brawl"]
 ] as const;
 
+export const FORMAT_FILTER_OPTIONS = [["", "Any format"], ...FORMATS] as const;
+export const DECK_FORMATS = [
+  ...FORMATS,
+  ["limited", "Limited"],
+  ["other", "Other / Event"]
+] as const;
+
 export const COLORS = ["W", "U", "B", "R", "G"] as const;
 export const CARD_TYPES = ["Creature", "Instant", "Sorcery", "Artifact", "Enchantment", "Planeswalker", "Land"] as const;
 export const RARITIES = ["common", "uncommon", "rare", "mythic"] as const;
@@ -19,7 +26,7 @@ export const VISIBLE_RESULTS_STEP = 120;
 
 export type FilterState = {
   q: string;
-  format: ArenaFormat;
+  format: ArenaFormat | "";
   colors: string[];
   mechanics: string[];
   types: string[];
@@ -71,6 +78,7 @@ export const defaultSearch: FilterState = {
 
 export const defaultStatsFilters: FilterState = {
   ...defaultFilterState,
+  format: "",
   ownedOnly: true,
   drilldownKind: "",
   drilldownKey: "",

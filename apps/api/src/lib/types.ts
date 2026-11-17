@@ -1,4 +1,4 @@
-import type { ArenaFormat } from "./formats.js";
+import type { DeckFormat } from "./formats.js";
 
 export type CardSummary = {
   id: string;
@@ -32,15 +32,21 @@ export type DeckCardInput = {
   section: "main" | "sideboard" | "commander";
   cardName?: string | undefined;
   typeLine?: string | undefined;
-  ownedCount?: number | undefined;
+  ownedCount?: number | null | undefined;
 };
 
 export type DeckRecord = {
   id: string;
   name: string;
-  format: ArenaFormat;
+  format: DeckFormat;
   notes: string;
   createdAt: string;
   updatedAt: string;
+  source: "local" | "arena";
+  externalId: string | null;
+  sourceFormat: string | null;
+  sourceUpdatedAt: string | null;
+  lastPlayedAt: string | null;
+  isFavorite: boolean;
   cards: DeckCardInput[];
 };

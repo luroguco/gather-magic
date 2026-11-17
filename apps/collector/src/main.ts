@@ -2,14 +2,9 @@ import { appendFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { parseProbeRequest, type ProbeRequest } from "./ipcValidation.js";
 
-type ProbeOverrides = {
-  pid?: number;
-  scryAddonPath?: string;
-  processPatterns?: string[];
-  metadataTargets?: string[];
-  monoImages?: string[];
-};
+type ProbeOverrides = ProbeRequest;
 
 type ProbeReport = {
   generatedAt?: string;
@@ -42,8 +37,14 @@ const packageRoot = resolve(currentDir, "..");
 const defaultWorkspaceRoot = resolve(packageRoot, "../..");
 const uiPreloadPath = resolve(packageRoot, "dist/uiPreload.cjs");
 const indexPath = resolve(packageRoot, "dist/index.html");
+const indexUrl = pathToFileURL(indexPath).href;
+const externalResearchCodeEnabled =
+  !app.isPackaged || process.env.COLLECTOR_ALLOW_EXTERNAL_RESEARCH_CODE === "1";
 
 const resolveWorkspaceRoot = () => {
+  if (!externalResearchCodeEnabled) {
+    return null;
+  }
   const candidates = [
     process.env.COLLECTOR_WORKSPACE_ROOT,
     process.cwd(),
@@ -63,7 +64,7 @@ const resolveWorkspaceRoot = () => {
 const workspaceRoot = resolveWorkspaceRoot();
 const probeModulePath = workspaceRoot
   ? resolve(workspaceRoot, "apps/api/dist/scripts/probeMtgaRuntime.js")
-  : resolve(defaultWorkspaceRoot, "apps/api/dist/scripts/probeMtgaRuntime.js");
+  : "";
 const collectorDataDirectory = workspaceRoot
   ? resolve(workspaceRoot, "data/collector")
   : resolve(process.env.HOME ?? packageRoot, "Library/Application Support/mtga-collector-spike");
@@ -163,7 +164,7 @@ const createMainWindow = () => {
     minHeight: 680,
     webPreferences: {
       preload: uiPreloadPath,
-      sandbox: false,
+      sandbox: true,
       contextIsolation: true,
       nodeIntegration: false
     }
@@ -176,7 +177,9 @@ const createMainWindow = () => {
 const runRuntimeProbe = async (overrides: ProbeOverrides = {}): Promise<ProbeRunResult> => {
   if (!existsSync(probeModulePath)) {
     throw new Error(
-      `Probe module not found at ${probeModulePath}. Build the API workspace first with "npm run build -w @mtga/api".`
+      app.isPackaged && !externalResearchCodeEnabled
+        ? "External research code is disabled in packaged builds. A bundled signed reader is required before release."
+        : `Probe module not found at ${probeModulePath}. Build the API workspace first with "npm run build -w @mtga/api".`
     );
   }
 
@@ -199,10 +202,20 @@ const runRuntimeProbe = async (overrides: ProbeOverrides = {}): Promise<ProbeRun
 };
 
 const registerIpcHandlers = () => {
-  ipcMain.handle("collector:get-status", () => buildStatusPayload());
-  ipcMain.handle("collector:run-runtime-probe", async (_event, overrides?: ProbeOverrides) =>
-    runRuntimeProbe(overrides ?? {})
-  );
+  const assertTrustedSender = (senderUrl: string) => {
+    if (senderUrl !== indexUrl) {
+      throw new Error("Collector IPC request came from an untrusted frame.");
+    }
+  };
+
+  ipcMain.handle("collector:get-status", (event) => {
+    assertTrustedSender(event.senderFrame?.url ?? "");
+    return buildStatusPayload();
+  });
+  ipcMain.handle("collector:run-runtime-probe", async (event, request?: unknown) => {
+    assertTrustedSender(event.senderFrame?.url ?? "");
+    return runRuntimeProbe(parseProbeRequest(request));
+  });
 };
 
 const main = async () => {

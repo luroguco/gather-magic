@@ -8,6 +8,7 @@ Core goals:
 - import an MTG Arena collection CSV reliably
 - search the Arena card pool with more deterministic mechanic filtering than typical public tools
 - build and validate decks against owned cards and Arena format rules
+- offer an opt-in Collection Coach that proposes a few understandable, collection-fit starting drafts
 - keep the UI usable for direct tinkering without requiring AI
 
 AI planning exists separately in:
@@ -19,24 +20,29 @@ Collector app planning exists separately in:
 ## Current Stack
 
 - React + Vite frontend
-- Fastify backend
+- modular Fastify backend
 - SQLite local database
+- ordered SQLite migrations and collection import history
+- shared runtime-validated wire contracts
 - Scryfall bulk data as the canonical Arena card source
 - TypeScript throughout
 
 ## Current Data Flow
 
-1. `npm run db:sync`
-   Downloads and syncs canonical Arena-relevant card data into `data/mtga.sqlite`.
+1. Collection sync
+   The recommended Companion flow refreshes canonical Arena-relevant Scryfall data in `data/mtga.sqlite`, captures the live Arena collection, and previews the resulting changes. `npm run db:sync` remains available as a catalog-only command.
 
 2. Collection import
-   Uploading an Arena collection CSV replaces the current ownership snapshot.
+   Confirming a preview replaces the current ownership snapshot. CSV and JSON uploads remain available as fallback paths.
 
 3. Search
    The UI queries the backend with structured filters for text, colors, types, rarity, mana value, formats, and mechanics.
 
 4. Deck building
    Cards can be added to saved decks, then validated and exported in Arena deck text format.
+
+5. Collection Coach Beta
+   The additive, non-default Coach can generate up to three deterministic Standard or Brawl ideas, build a complete validated prototype on selection, and save it through the existing deck workflow.
 
 ## Implemented Features
 
@@ -58,7 +64,7 @@ Collector app planning exists separately in:
 
 ### Frontend
 
-- tabs for `Search`, `Decks`, and `Import`
+- tabs for `Search`, `Stats`, `Decks`, `Collection`, and the additive, non-default `Coach Beta`
 - structured filter UI
 - grouped mechanic quick-pick sidebar
 - mechanic glossary modal
@@ -70,6 +76,18 @@ Collector app planning exists separately in:
   - subtle `+Main` / `+Side` / `+Cmdr` actions
 - deck editor with validation and export
 - collection status summary
+
+### Collection Coach Beta
+
+- local, deterministic feature classification; no AI or external metagame calls
+- owned-only by default, with optional exact per-rarity per-brew wildcard limits
+- Standard BO1 and separate commander-first Brawl generation
+- up to three ideas, followed by grouped review, constrained tuning, local save, or save-and-edit
+- source fingerprints reject stale prototypes after collection or catalog changes
+- shared structured legality validation before any Coach prototype can be saved
+- product-quality review is still pending, so Coach must not become the default destination yet
+
+See [COLLECTION_COACH.md](COLLECTION_COACH.md) for the implemented scope and deferred promotion gate.
 
 ## Important Behavior Decisions
 
@@ -129,12 +147,16 @@ Mechanic counts after owned-only filtering:
 - some derived mechanic heuristics are intentionally rough and can be expanded further
 - a few derived tags currently produce zero full-catalog hits
 - no auth, sync, or multi-user support
-- no AI assistant implementation yet, only the plan
+- no AI assistant implementation; Coach is intentionally deterministic and local
+- Coach's manual Standard and Brawl product-quality gate has not been completed
+- direct MTGA capture remains a research path because the proven probe uses runtime signing and a private Untapped addon
+- desktop packaging is release-gated until an owned/licensed, pre-signed reader helper exists
 
 ## Recommended Near-Term Work
 
 ### UX / Product
 
+- complete the documented Coach Beta manual quality gate before considering default navigation
 - continue refining the search and card-detail experience
 - improve mechanic curation further if the glossary still feels too broad
 - add stronger deckbuilding workflows such as shortlist, compare, and candidate packages

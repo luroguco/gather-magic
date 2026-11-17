@@ -1,6 +1,6 @@
 # Collector Host Spike
 
-This workspace is the Phase 0 host spike for direct MTGA collection capture.
+This workspace is the Phase 0 host spike for direct MTGA collection capture. It is research code, not a distributable collector.
 
 Current purpose:
 - launch a local Electron host
@@ -29,7 +29,13 @@ Runs the runtime probe in headless mode and exits after saving a report.
 npm run collector:package:mac
 ```
 
-Packages a macOS `.app` bundle under `apps/collector/out/mac/`.
+Packaging is release-gated. For an explicit local-only research build, prefix the package command with:
+
+```bash
+COLLECTOR_ALLOW_RESEARCH_PACKAGE=1
+```
+
+The resulting shell is unprivileged and will not load external workspace probe code when packaged unless `COLLECTOR_ALLOW_EXTERNAL_RESEARCH_CODE=1` is also explicitly supplied. Neither override is suitable for distribution.
 
 ```bash
 npm run collector:package:mac:adhoc
@@ -78,4 +84,8 @@ Current machine constraint:
 Current ad hoc result:
 - a packaged ad hoc signed run still ends with `Scry.connect(...)` failing against the live MTGA PID
 
-The first real decision point is whether an Apple-signed packaged Electron app changes the `Scry.connect(...)` result. If not, the next path should be a signed native helper bundle rather than more work on the Electron shape.
+The next product decision is whether a fixed, independently signed reader helper can perform stable capture without private dependencies. The Electron shell itself is no longer treated as the privileged reader.
+
+## Release boundary
+
+The eventual product topology is an unprivileged controller launching a short-lived, pre-signed reader helper. Debugger-style entitlements must not be applied to the Electron application or inherited by its renderer/helper processes. Runtime signing and private Untapped addon loading are prohibited release paths.
